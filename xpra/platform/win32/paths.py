@@ -8,13 +8,15 @@ import os.path
 import sys
 import tempfile
 import platform
-from ctypes import WinDLL, create_unicode_buffer
-from ctypes.wintypes import MAX_PATH
+from ctypes import WinDLL, create_unicode_buffer, HRESULT
+from ctypes.wintypes import MAX_PATH, HWND, INT, HANDLE, DWORD, LPWSTR
 
 from xpra.util.io import get_util_logger
 
 shell32 = WinDLL("shell32", use_last_error=True)
 SHGetFolderPath = shell32.SHGetFolderPathW
+SHGetFolderPath.argtypes = [HWND, INT, HANDLE, DWORD, LPWSTR]
+SHGetFolderPath.restype = HRESULT
 
 CSIDL_APPDATA = 26
 CSIDL_LOCAL_APPDATA = 28
@@ -47,12 +49,17 @@ def get_appdata_dir(roaming=True) -> str:
         # UAC in vista onwards will not allow us to write where the software is installed,
         # so we place the log file (etc) in "~/Application Data"
         appdata = os.environ.get("APPDATA" if roaming else "LOCALAPPDATA", "")
+    if appdata and not os.path.exists(appdata):
+        try:
+            os.mkdir(appdata)
+        except OSError as e:
+            get_util_logger().warn("Warning: %r does not exist and cannot be created:", appdata)
+            get_util_logger().warn(" %s", e)
+            appdata = ""
     if not appdata:
         # we need some kind of path..
         appdata = tempfile.gettempdir()
         assert appdata, "cannot find any usable directory for log files"
-    if not os.path.exists(appdata):
-        os.mkdir(appdata)
     data_dir = os.path.join(appdata, "Xpra")
     return data_dir
 
@@ -85,7 +92,7 @@ def do_get_icon_dir() -> str:
 
 
 def do_get_default_log_dirs() -> list[str]:
-    dd = _get_data_dir()
+    dd = _get_data_dir(False)
     temp = tempfile.gettempdir()
     if dd == temp:
         return [temp]
@@ -173,7 +180,7 @@ def do_get_default_conf_dirs() -> list[str]:
 
 
 def do_get_user_conf_dirs(_uid) -> list[str]:
-    dd = _get_data_dir()
+    dd = _get_data_dir(True)
     # ie: "C:\Users\<user name>\AppData\Roaming"
     SYSTEMROOT = os.environ.get("SYSTEMROOT", "")
     # ie: when running as a system service, we may get:
