@@ -54,6 +54,8 @@ def parse_scale(scale: str) -> float:
 
 def dpiv(size: int, size_mm: int) -> int:
     """ convert a screen size ratio into a DPI value """
+    if size_mm <= 0:
+        return 0
     return round(size * 25.4 / size_mm)
 
 
@@ -139,7 +141,7 @@ def get_argv() -> list[str]:
     xvfb = which("Xvfb") or ""
     if xvfb:
         from xpra.scripts.config import get_Xvfb_command
-        argv.append("--xvfb=%s" % shlex.join(get_Xvfb_command(width, height, dpi * scale)))
+        argv.append("--xvfb=%s" % shlex.join(get_Xvfb_command(width, height, dpi=dpi * scale)))
     if width > 0 and height > 0:
         argv.append("--resize-display=%ix%i" % (width // scale, height // scale))
     if 10 < dpi < 1000:
