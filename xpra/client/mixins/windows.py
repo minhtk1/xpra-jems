@@ -16,7 +16,7 @@ from collections import deque
 from time import sleep, time, monotonic
 from queue import SimpleQueue
 from threading import Thread
-from typing import Any
+from typing import Any, Optional
 from subprocess import Popen, PIPE, STDOUT, TimeoutExpired
 from collections.abc import Callable, Sequence
 
@@ -82,6 +82,13 @@ ICON_SHRINKAGE: int = envint("XPRA_ICON_SHRINKAGE", 75)
 SAVE_WINDOW_ICONS: bool = envbool("XPRA_SAVE_WINDOW_ICONS", False)
 SAVE_CURSORS: bool = envbool("XPRA_SAVE_CURSORS", False)
 POLL_POINTER = envint("XPRA_POLL_POINTER", 0)
+
+# heuristics used to identify owner-less popup menus (Wine toolwindows, etc)
+POPUP_CLASS_KEYWORDS: tuple[str, ...] = ("menu", "popup", "dropdown", "combo", "tool", "tip")
+POPUP_ROLE_KEYWORDS: tuple[str, ...] = ("popup", "tooltip", "tool_tip", "combo", "dropdown", "menu")
+POPUP_WINDOW_TYPES: set[str] = {"MENU", "POPUP_MENU", "DROPDOWN_MENU", "TOOLTIP", "NOTIFICATION", "COMBO", "UTILITY"}
+POPUP_DIALOG_HINT_TYPES: set[str] = {"DIALOG"}
+POPUP_MAX_DIMENSION: int = envint("XPRA_POPUP_MAX_DIMENSION", 640)
 
 DRAW_LOG_FMT = "process_draw: %7i %8s for window %3i, sequence %8i, %4ix%-4i at %4i,%-4i" \
                " using %6s encoding with options=%s"
@@ -859,6 +866,67 @@ class WindowClient(StubClientMixin):
                 iconlog("client composited window icon saved to %s", filename)
         return icon
 
+    def _analyze_popup_candidate(self, metadata: typedict, w: int, h: int) -> dict[str, Any]:
+        owner_wid = metadata.intget("transient-for", 0) or metadata.intget("parent", 0)
+        ownerless = owner_wid <= 0
+        wm_class = metadata.strtupleget("class-instance", (None, None), 2, 2)
+        class_parts = [c.lower() for c in wm_class if c]
+        class_name = " ".join(class_parts)
+        has_class_hint = bool(class_name and any(k in class_name for k in POPUP_CLASS_KEYWORDS))
+        title = metadata.strget("title", "")
+        empty_title = not title or not title.strip()
+        role = metadata.strget("role", "").strip().lower()
+        has_role_hint = bool(role and role in POPUP_ROLE_KEYWORDS)
+        window_types = metadata.strtupleget("window-type", ())
+        popup_type_hint = any(t in POPUP_WINDOW_TYPES for t in window_types)
+        dialog_hint = any(t in POPUP_DIALOG_HINT_TYPES for t in window_types) and empty_title
+        skip_taskbar = metadata.boolget("skip-taskbar")
+        skip_pager = metadata.boolget("skip-pager")
+        above = metadata.boolget("above")
+        requested_position = bool(metadata.get("requested-position"))
+        undecorated = metadata.intget("decorations", 1) <= 0
+        is_small = w <= POPUP_MAX_DIMENSION and h <= POPUP_MAX_DIMENSION
+        intent_features: list[str] = []
+        support_features: list[str] = []
+        if empty_title:
+            intent_features.append("empty-title")
+        if has_class_hint:
+            intent_features.append("wm-class")
+        if has_role_hint:
+            intent_features.append(f"role={role}")
+        if popup_type_hint:
+            intent_features.append("window-type")
+        if dialog_hint:
+            intent_features.append("dialog+empty-title")
+        if skip_taskbar:
+            intent_features.append("skip-taskbar")
+        if is_small:
+            support_features.append("small")
+        if undecorated:
+            support_features.append("undecorated")
+        if requested_position:
+            support_features.append("requested-position")
+        heuristics_popup = len(intent_features) >= 1 and (len(intent_features) + len(support_features)) >= 2
+        follow_window = None
+        if hasattr(self, "find_window"):
+            try:
+                follow_window = self.find_window(metadata, "transient-for") or self.find_window(metadata, "parent")
+            except Exception:
+                follow_window = None
+        features_for_log = ", ".join(intent_features + support_features) or "none"
+        return {
+            "owner_wid": owner_wid,
+            "ownerless": ownerless,
+            "intent_features": intent_features,
+            "support_features": support_features,
+            "heuristics_popup": heuristics_popup,
+            "follow_window": follow_window,
+            "features_for_log": features_for_log,
+            "skip_taskbar": skip_taskbar,
+            "skip_pager": skip_pager,
+            "above": above,
+        }
+
     ######################################################################
     # regular windows:
     def _process_new_common(self, packet: PacketType, override_redirect):
@@ -871,10 +939,40 @@ class WindowClient(StubClientMixin):
         if w < 1 or h < 1:
             log.error("Error: window %i dimensions %ix%i are invalid", wid, w, h)
             w, h = 1, 1
+        popup_info = self._analyze_popup_candidate(metadata, w, h)
+        heuristics_popup = popup_info["heuristics_popup"]
+        force_override = popup_info["ownerless"] or popup_info["skip_taskbar"] or popup_info["skip_pager"] or popup_info["above"]
+        if not override_redirect and heuristics_popup and force_override:
+            override_redirect = True
+            metadata["override-redirect"] = True
+            if not metadata.strget("role"):
+                metadata["role"] = "popup"
+            geomlog("🍷 WINE POPUP _process_new_common: forcing override-redirect (wid=%s, features=%s, reason=%s)",
+                    wid, popup_info["features_for_log"],
+                    "ownerless" if popup_info["ownerless"] else "skip-taskbar/pager/above")
+        elif override_redirect:
+            metadata["override-redirect"] = True
+        if heuristics_popup:
+            metadata["_client-popup-heuristics"] = True
+        follow_window = popup_info["follow_window"]
+        has_owner_hint = popup_info["owner_wid"] > 0 or follow_window is not None
+        is_likely_wine_popup = override_redirect and (has_owner_hint or heuristics_popup)
+        if is_likely_wine_popup:
+            geomlog("🍷 WINE POPUP _process_new_common: Likely Wine popup detected (wid=%s, owner_hint=%s, features=%s)",
+                    wid, has_owner_hint, popup_info["features_for_log"])
+            geomlog("🍷 WINE POPUP _process_new_common: SKIPPING relative-position logic (wid=%s)", wid)
+        if override_redirect and metadata.intget("transient-for", 0) <= 0 and heuristics_popup:
+            assigned_owner = self._assign_transient_for_from_pid(metadata)
+            if assigned_owner:
+                geomlog("🍷 WINE POPUP _process_new_common: inferred transient-for=%s using pid (wid=%s)",
+                        assigned_owner, wid)
+
         rel_pos = metadata.inttupleget("relative-position")
         parent = metadata.intget("parent")
         geomlog("relative-position=%s (parent=%s)", rel_pos, parent)
-        if parent and rel_pos:
+        # PATCH: Skip relative-position cho Wine popup menus
+        # Wine popup có absolute position từ server, không nên apply relative-position
+        if parent and rel_pos and not is_likely_wine_popup:
             pwin = self._id_to_window.get(parent)
             if pwin:
                 # apply scaling to relative position:
@@ -894,17 +992,63 @@ class WindowClient(StubClientMixin):
             client_properties = dict(packet[7])
         geomlog("process_new_common: wid=%i, OR=%s, geometry(%s)=%s / %s",
                 wid, override_redirect, packet[2:6], (wx, wy, ww, wh), (bw, bh))
-        return self.make_new_window(wid, wx, wy, ww, wh, bw, bh, metadata, override_redirect, client_properties)
+        
+        # PATCH: Preserve position cho Wine popup menus khi window bị tạo lại
+        # Server có thể xóa và tạo lại window khi nhận diện sai window type
+        # Nếu là OR window và có thể là Wine popup, preserve position từ server
+        preserved_position = None
+        if is_likely_wine_popup:
+            # Preserve position từ server (không apply relative position nếu đã có)
+            # Position từ server đã đúng cho Wine popup
+            # Lưu ý: wx, wy đã được scale, nhưng position từ server đã đúng
+            preserved_position = (wx, wy)
+            geomlog("🍷 WINE POPUP _process_new_common: Preserving position from server: (%s, %s) (wid=%s)", wx, wy, wid)
+        
+        window = self.make_new_window(wid, wx, wy, ww, wh, bw, bh, metadata, override_redirect, client_properties)
+        
+        # PATCH: Set preserved position cho Wine popup nếu có
+        if preserved_position and window and hasattr(window, '_pos'):
+            # Đảm bảo position được preserve ngay từ đầu
+            window._pos = preserved_position
+            geomlog("🍷 WINE POPUP _process_new_common: ✅ Position preserved: (%s, %s) (wid=%s)", preserved_position[0], preserved_position[1], wid)
+        
+        return window
 
     def _find_pid_focused_window(self, pid: int, OR=False) -> int:
+        fallback = 0
         for twid, twin in self._id_to_window.items():
             if twin.is_tray():
                 continue
             if twin.is_OR() != OR:
                 continue
-            if twin._metadata.intget("pid", -1) == pid:
-                if OR or twid == self._focused:
-                    return twid
+            if twin._metadata.intget("pid", -1) != pid:
+                continue
+            if OR or twid == self._focused:
+                return twid
+            if fallback == 0:
+                fallback = twid
+        if fallback and not OR:
+            focuslog("fallback transient-for candidate for pid %s -> wid %s", pid, fallback)
+        return fallback
+
+    def _assign_transient_for_from_pid(self, metadata: typedict, prefer_or: Optional[bool] = None) -> int:
+        if metadata.intget("transient-for", 0) > 0:
+            return metadata.intget("transient-for", 0)
+        pid = metadata.intget("pid", 0)
+        if not pid:
+            return 0
+        search_order: list[bool] = []
+        if prefer_or is True:
+            search_order = [True, False]
+        elif prefer_or is False:
+            search_order = [False, True]
+        else:
+            search_order = [False, True]
+        for want_or in search_order:
+            twid = self._find_pid_focused_window(pid, want_or)
+            if twid:
+                metadata["transient-for"] = twid
+                return twid
         return 0
 
     def patch_OR_popup_transient_for(self, metadata: typedict) -> None:
@@ -932,7 +1076,9 @@ class WindowClient(StubClientMixin):
         # if possible, choosing the currently focused window (if there is one..)
         pid = metadata.intget("pid", 0)
         watcher_pid = self.assign_signal_watcher_pid(wid, pid, metadata.strget("title"))
-        if override_redirect and metadata.strget("role").lower() == "popup" and pid:
+        role_name = metadata.strget("role").lower()
+        heuristics_flag = metadata.boolget("_client-popup-heuristics", False)
+        if override_redirect and pid and (role_name == "popup" or heuristics_flag):
             self.patch_OR_popup_transient_for(metadata)
         border = None
         if self.border:
@@ -1236,6 +1382,22 @@ class WindowClient(StubClientMixin):
         geomlog("_process_window_move_resize%s moving / resizing window %s (id=%s) to %s",
                 packet[1:], window, wid, (ax, ay, aw, ah))
         if window:
+            # PATCH: Skip move cho Wine popup menus - chỉ resize nếu cần
+            # Wine popup menus có absolute position từ server, không nên move
+            if hasattr(window, '_is_wine_popup_menu'):
+                is_wine_popup = window._is_wine_popup_menu()
+                if is_wine_popup:
+                    geomlog("🍷 WINE POPUP _process_window_move_resize: SKIPPING move, only resize if needed (wid=%s)", wid)
+                    geomlog("🍷 WINE POPUP _process_window_move_resize: Requested position: (%s, %s), Current: %s (wid=%s)", 
+                           ax, ay, window._pos, wid)
+                    # Chỉ resize nếu size thay đổi, giữ nguyên position
+                    current_w, current_h = window._size
+                    if (aw, ah) != (current_w, current_h):
+                        geomlog("🍷 WINE POPUP _process_window_move_resize: Resizing to (%s, %s) (wid=%s)", aw, ah, wid)
+                        window.resize(aw, ah)
+                    else:
+                        geomlog("🍷 WINE POPUP _process_window_move_resize: Size unchanged, no action (wid=%s)", wid)
+                    return
             window.move_resize(ax, ay, aw, ah, resize_counter)
 
     def _process_window_resized(self, packet: PacketType) -> None:
@@ -1270,6 +1432,22 @@ class WindowClient(StubClientMixin):
         geomlog("_process_configure_override_redirect%s move resize window %s (id=%s) to %s",
                 packet[1:], window, wid, (ax, ay, aw, ah))
         if window:
+            # PATCH: Skip move cho Wine popup menus - chỉ resize nếu cần
+            # Wine popup menus có absolute position từ server, không nên move
+            if hasattr(window, '_is_wine_popup_menu'):
+                is_wine_popup = window._is_wine_popup_menu()
+                if is_wine_popup:
+                    geomlog("🍷 WINE POPUP _process_configure_override_redirect: SKIPPING move, only resize if needed (wid=%s)", wid)
+                    geomlog("🍷 WINE POPUP _process_configure_override_redirect: Requested position: (%s, %s), Current: %s (wid=%s)", 
+                           ax, ay, window._pos, wid)
+                    # Chỉ resize nếu size thay đổi, giữ nguyên position
+                    current_w, current_h = window._size
+                    if (aw, ah) != (current_w, current_h):
+                        geomlog("🍷 WINE POPUP _process_configure_override_redirect: Resizing to (%s, %s) (wid=%s)", aw, ah, wid)
+                        window.resize(aw, ah)
+                    else:
+                        geomlog("🍷 WINE POPUP _process_configure_override_redirect: Size unchanged, no action (wid=%s)", wid)
+                    return
             window.move_resize(ax, ay, aw, ah, -1)
 
     # noinspection PyUnreachableCode
