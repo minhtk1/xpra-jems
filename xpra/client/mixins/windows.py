@@ -941,7 +941,10 @@ class WindowClient(StubClientMixin):
             w, h = 1, 1
         popup_info = self._analyze_popup_candidate(metadata, w, h)
         heuristics_popup = popup_info["heuristics_popup"]
-        force_override = popup_info["ownerless"] or popup_info["skip_taskbar"] or popup_info["skip_pager"] or popup_info["above"]
+        is_decorated = metadata.intget("decorations", 1) > 0
+        force_override = popup_info["ownerless"] or (
+            (popup_info["skip_taskbar"] or popup_info["skip_pager"] or popup_info["above"]) and not is_decorated
+        )
         if not override_redirect and heuristics_popup and force_override:
             override_redirect = True
             metadata["override-redirect"] = True
@@ -952,6 +955,14 @@ class WindowClient(StubClientMixin):
                     "ownerless" if popup_info["ownerless"] else "skip-taskbar/pager/above")
         elif override_redirect:
             metadata["override-redirect"] = True
+        elif (
+            heuristics_popup
+            and (popup_info["skip_taskbar"] or popup_info["skip_pager"] or popup_info["above"])
+            and is_decorated
+            and not popup_info["ownerless"]
+        ):
+            geomlog("🍷 WINE POPUP _process_new_common: NOT forcing OR for decorated window (wid=%s, features=%s)",
+                    wid, popup_info["features_for_log"])
         if heuristics_popup:
             metadata["_client-popup-heuristics"] = True
         follow_window = popup_info["follow_window"]
