@@ -495,6 +495,16 @@ class KeyboardConfig(KeyboardConfigBase):
             return client_keycode, group
         if self.x11_keycodes and client_keycode > 0:
             keycode = self.keycode_translation.get((client_keycode, keyname), 0) or client_keycode
+            keysyms = self.keycode_mappings.get(keycode) or []
+            if keyname not in keysyms:
+                # client keycode does not map to this keysym on the server, try resolving by keysym
+                try_keycodes = X11Keyboard.get_keycodes(keyname)
+                if try_keycodes:
+                    kmlog(keyname, "remapping client keycode %s -> %s via keysym lookup", keycode, try_keycodes[0])
+                    keycode = try_keycodes[0]
+                else:
+                    kmlog(keyname, "no server keycode for %s, falling back to keycode matching logic", keyname)
+                    return self.find_matching_keycode(client_keycode, keyname, pressed, modifiers, keyval, keystr, group)
             kmlog(keyname, "do_get_keycode (%i, %s)=%s (native keymap)", client_keycode, keyname, keycode)
             return keycode, group
         return self.find_matching_keycode(client_keycode, keyname, pressed, modifiers, keyval, keystr, group)

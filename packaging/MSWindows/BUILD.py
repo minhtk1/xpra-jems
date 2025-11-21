@@ -23,7 +23,8 @@ from glob import glob
 from subprocess import getstatusoutput, check_output, Popen, PIPE
 from shutil import which, rmtree, copyfile, move, copytree
 
-KEY_FILE = "E:\\xpra.pfx"
+KEY_FILE = "D:\\xpra.pfx"
+KEY_PASSWORD = os.environ.get("SIGN_PFX_PASS", "Minh311094")
 DIST = "dist"
 LIB_DIR = f"{DIST}/lib"
 
@@ -236,15 +237,15 @@ def check_signtool() -> None:
         return
     try:
         signtool = find_command("signtool", "SIGNTOOL",
-                                f"{PROGRAMFILES}\\Microsoft SDKs\\Windows\\v7.1\\Bin\\signtool.exe"
-                                f"{PROGRAMFILES}\\Microsoft SDKs\\Windows\\v7.1A\\Bin\\signtool.exe"
-                                f"{PROGRAMFILES_X86}\\Windows Kits\\8.1\\Bin\\x64\\signtool.exe"
+                                f"{PROGRAMFILES}\\Microsoft SDKs\\Windows\\v7.1\\Bin\\signtool.exe",
+                                f"{PROGRAMFILES}\\Microsoft SDKs\\Windows\\v7.1A\\Bin\\signtool.exe",
+                                f"{PROGRAMFILES_X86}\\Windows Kits\\8.1\\Bin\\x64\\signtool.exe",
                                 f"{PROGRAMFILES_X86}\\Windows Kits\\10\\App Certification Kit\\signtool.exe")
     except RuntimeError:
         signtool = ""
     if not signtool:
         # try the hard (slow) way:
-        signtool = find_vs_command("signtool.exe")
+        signtool = find_vs_command("signtool")
         if not signtool:
             raise RuntimeError("signtool not found")
     debug(f"{signtool=}")
@@ -1219,10 +1220,13 @@ def export_sbom() -> None:
 
 
 def verpatch() -> None:
+    verpatch_exe = find_command("verpatch", "VERPATCH",
+                                "packaging/MSWindows/tools/verpatch.exe",
+                                "packaging/MSWindows/tools/VerPatch.exe")
     EXCLUDE = ("plink", "openssh", "openssl", "paexec")
 
     def run_verpatch(filename: str, descr: str) -> None:
-        log_command(["verpatch", filename,
+        log_command([verpatch_exe, filename,
                      "/s", "desc", descr,
                      "/va", version_info.padded,
                      "/s", "company", "xpra.org",
@@ -1312,7 +1316,12 @@ def create_exe(args) -> str:
 
 
 def sign_file(filename: str) -> None:
-    log_command(["signtool.exe", "sign", "/fd", "SHA256", "/v", "/f", KEY_FILE, "/t", TIMESTAMP_SERVER, filename], "signtool.log")
+    cmd = ["signtool.exe", "sign", "/fd", "SHA256", "/v", "/f", KEY_FILE]
+    if KEY_PASSWORD:
+        cmd += ["/p", KEY_PASSWORD]
+    # timestamp kiểu mới (RFC3161):
+    cmd += ["/tr", TIMESTAMP_SERVER, "/td", "SHA256", filename]
+    log_command(cmd, "signtool.log")
 
 
 def create_msi(exe: str) -> str:

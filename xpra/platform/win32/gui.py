@@ -11,6 +11,7 @@ import sys
 import types
 from typing import Any
 from collections.abc import Callable
+from time import monotonic
 from ctypes import (
     WinDLL, WinError, get_last_error,  # @UnresolvedImport
     CDLL, pythonapi, py_object,
@@ -56,6 +57,7 @@ grablog = Logger("win32", "grab")
 screenlog = Logger("win32", "screen")
 keylog = Logger("win32", "keyboard")
 mouselog = Logger("win32", "mouse")
+zenlog = Logger("keyboard", "zenkaku")
 
 GLib = gi_import("GLib")
 
@@ -65,6 +67,7 @@ REINIT_VISIBLE_WINDOWS = envbool("XPRA_WIN32_REINIT_VISIBLE_WINDOWS", True)
 SCREENSAVER_LISTENER_POLL_DELAY = envint("XPRA_SCREENSAVER_LISTENER_POLL_DELAY", 10)
 APP_ID = os.environ.get("XPRA_WIN32_APP_ID", "Xpra")
 MONITOR_DPI = envbool("XPRA_WIN32_MONITOR_DPI", True)
+ZENKAKU_DEBOUNCE_MS = envint("XPRA_ZENKAKU_DEBOUNCE_MS", 1000)
 
 PyCapsule_GetPointer = pythonapi.PyCapsule_GetPointer
 PyCapsule_GetPointer.restype = HGDIOBJ
@@ -1173,6 +1176,10 @@ class ClientExtras:
             self.client.window_keyboard_layout_changed()
 
     def init_keyboard_listener(self) -> None:
+        # track last state of zenkaku key to avoid duplicate toggles
+        self._zenkaku_pressed: bool = False
+        self._last_focused: int | None = None
+        self._last_zenkaku_ms: float = 0.0
         class KBDLLHOOKSTRUCT(Structure):
             _fields_ = [
                 ("vk_code", DWORD),
@@ -1192,6 +1199,12 @@ class ClientExtras:
             win32con.WM_KEYUP: "KEYUP",
             win32con.WM_SYSKEYUP: "SYSKEYUP",
         }
+        # Some Japanese keyboards emit OEM_ENLW (0xF4) on the 半角／全角 key instead of VK_KANA (0x15)
+        VK_OEM_ENLW = 0xF4
+        VK_OEM_F3 = 0xF3  # observed keyup on some JP keyboards
+        ZEN_VKS = (win32con.VK_KANA, VK_OEM_ENLW, VK_OEM_F3)
+        ZENKAKU_KEYVAL = 0xFF2A  # XK_Zenkaku_Hankaku keysym so IME toggles reliably
+        ZENKAKU_KEYCODE_FALLBACK = 49  # typical X11 keycode for Zenkaku on JP layout
 
         def low_level_keyboard_handler(nCode: int, wParam: int, lParam: int):
             log("WH_KEYBOARD_LL: %s", (nCode, wParam, lParam))
@@ -1205,6 +1218,133 @@ class ClientExtras:
             try:
                 scan_code = lParam.contents.scan_code
                 vk_code = lParam.contents.vk_code
+                focused = getattr(self.client, "_focused", None)
+                if focused:
+                    self._last_focused = focused
+                if zenlog.debug_enabled:
+                    zenlog.info(
+                        "win32 key event: vk=%#x scan=%#x event=%s flags=%#x focused=%s grabbed=%s",
+                        vk_code,
+                        scan_code,
+                        ALL_KEY_EVENTS.get(wParam),
+                        lParam.contents.flags,
+                        getattr(self.client, "_focused", None),
+                        bool(getattr(self.client, "keyboard_grabbed", False)),
+                    )
+                if vk_code in ZEN_VKS:
+                    zenlog.info(
+                        "zenkaku candidate: event=%s vk=%#x scan=%#x pressed=%s last_state=%s last_ms=%.0f focused=%s",
+                        ALL_KEY_EVENTS.get(wParam),
+                        vk_code,
+                        scan_code,
+                        wParam in DOWN,
+                        self._zenkaku_pressed,
+                        self._last_zenkaku_ms,
+                        focused,
+                    )
+                    if kh and getattr(kh, "keyboard", None):
+                        modifiers: list[str] = []
+                        modifier_keycodes = kh.keyboard.modifier_keycodes
+                        modifier_keys = kh.keyboard.modifier_keys
+                        for vk, modkeynames in {
+                            win32con.VK_NUMLOCK: ["Num_Lock"],
+                            win32con.VK_CAPITAL: ["Caps_Lock"],
+                            win32con.VK_CONTROL: ["Control_L", "Control_R"],
+                            win32con.VK_SHIFT: ["Shift_L", "Shift_R"],
+                        }.items():
+                            if GetKeyState(vk):
+                                for modkeyname in modkeynames:
+                                    mod = modifier_keys.get(modkeyname)
+                                    if mod:
+                                        modifiers.append(mod)
+                                        break
+                        # use client keymap keycode for this keysym when available,
+                        # otherwise fall back to standard X11 JP keycode so server can map keysym
+                        zenkaku_keycode = 0
+                        zenkaku_group = 0
+                        for keyval, keyname, keycode, group, _level in getattr(kh, "keycodes", ()):
+                            if keyname == "Zenkaku_Hankaku":
+                                zenkaku_keycode = keycode
+                                zenkaku_group = group
+                                break
+                        if zenkaku_keycode == 0:
+                            zenkaku_keycode = ZENKAKU_KEYCODE_FALLBACK
+                            zenlog.info(
+                                "zenkaku keycode fallback to %s (no client mapping), using common JP X11 mapping",
+                                zenkaku_keycode,
+                            )
+                        key_event = KeyEvent()
+                        key_event.keyname = "Zenkaku_Hankaku"
+                        key_event.pressed = wParam in DOWN
+                        # keep modifiers empty so IME toggle is clean
+                        key_event.modifiers = []
+                        key_event.keyval = ZENKAKU_KEYVAL
+                        key_event.keycode = zenkaku_keycode
+                        key_event.string = ""
+                        key_event.group = zenkaku_group
+                        # only send the press; fcitx/mozc toggles on press, avoid release churn
+                        if not key_event.pressed:
+                            if vk_code in (win32con.VK_KANA, VK_OEM_ENLW, VK_OEM_F3):
+                                zenlog.info(
+                                    "zenkaku release: vk=%#x clearing pressed state (was=%s)",
+                                    vk_code,
+                                    self._zenkaku_pressed,
+                                )
+                                self._zenkaku_pressed = False
+                            return CallNextHookEx(0, nCode, wParam, lParam)
+                        now_ms = monotonic() * 1000.0
+                        if key_event.pressed == self._zenkaku_pressed:
+                            zenlog.info(
+                                "skip duplicate zenkaku state=%s vk=%#x scan=%#x (pressed=%s delta=%.0fms)",
+                                key_event.pressed,
+                                vk_code,
+                                scan_code,
+                                self._zenkaku_pressed,
+                                now_ms - self._last_zenkaku_ms,
+                            )
+                            return CallNextHookEx(0, nCode, wParam, lParam)
+                        if now_ms - self._last_zenkaku_ms < ZENKAKU_DEBOUNCE_MS:
+                            zenlog.info(
+                                "skip zenkaku within debounce: delta=%.0fms threshold=%sms",
+                                now_ms - self._last_zenkaku_ms, ZENKAKU_DEBOUNCE_MS,
+                            )
+                            return CallNextHookEx(0, nCode, wParam, lParam)
+                        self._last_zenkaku_ms = now_ms
+                        self._zenkaku_pressed = key_event.pressed
+                        zenlog.info(
+                            "sending synthesized Zenkaku key: vk=%#x scan=%#x down=%s mods=%s keycode=%s keyval=%#x group=%s focused=%s",
+                            vk_code,
+                            scan_code,
+                            key_event.pressed,
+                            modifiers,
+                            key_event.keycode,
+                            key_event.keyval,
+                            key_event.group,
+                            focused or self._last_focused,
+                        )
+                        target = focused or self._last_focused
+                        if target:
+                            kh.send_key_action(target, key_event)
+                            return 1
+                        zenlog.info(
+                            "zenkaku key ignored: no focused window (focused=%s, last_focused=%s)",
+                            focused, self._last_focused,
+                        )
+                    else:
+                        zenlog.info(
+                            "zenkaku key ignored: missing keyboard_helper or keyboard (kh=%s)",
+                            kh,
+                        )
+                if vk_code in (win32con.VK_KANA, win32con.VK_KANJI):
+                    zenlog.info(
+                        "win32 zenkaku key %s: vk=%#x scan=%#x flags=%#x focused=%s grabbed=%s",
+                        ALL_KEY_EVENTS.get(wParam),
+                        vk_code,
+                        scan_code,
+                        lParam.contents.flags,
+                        getattr(self.client, "_focused", None),
+                        bool(getattr(self.client, "keyboard_grabbed", False)),
+                    )
                 focused = self.client._focused
                 # the keys we intercept before the OS:
                 keyname = {

@@ -50,6 +50,7 @@ workspacelog = Logger("workspace")
 log = Logger("window")
 keylog = Logger("keyboard")
 keyeventlog = Logger("keyboard", "events")
+zenlog = Logger("keyboard", "zenkaku")
 iconlog = Logger("icon")
 metalog = Logger("metadata")
 statelog = Logger("state")
@@ -3012,6 +3013,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
 
     def handle_key_press_event(self, _window, event) -> bool:
         key_event = self.parse_key_event(event, True)
+        self._log_zenkaku_key(event, key_event, True)
         if self.moveresize_event and key_event.keyname in BREAK_MOVERESIZE:
             # cancel move resize if there is one:
             self.moveresize_event = None
@@ -3022,8 +3024,31 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
 
     def handle_key_release_event(self, _window, event) -> bool:
         key_event = self.parse_key_event(event, False)
+        self._log_zenkaku_key(event, key_event, False)
         self._client.handle_key_action(self, key_event)
         return True
+
+    def _log_zenkaku_key(self, event, key_event: KeyEvent, pressed: bool) -> None:
+        """Log the Windows 全角／半角 key so we can confirm it is delivered."""
+        if not WIN32:
+            return
+        keyname = (key_event.keyname or "").lower()
+        hwcode = getattr(event, "hardware_keycode", 0)
+        keyval = getattr(event, "keyval", 0)
+        if keyname in {
+            "zenkaku_hankaku", "zenkaku", "hankaku",
+            "kanji", "hiragana_katakana", "kana_switch",
+        } or hwcode == 0x15:  # 0x15 is VK_KANA on Windows keyboards
+            zenlog.info(
+                "zenkaku key %s: keyname=%s keyval=%#x hwcode=%#x state=%#x group=%s string=%r",
+                "down" if pressed else "up",
+                key_event.keyname,
+                keyval or 0,
+                hwcode,
+                getattr(event, "state", 0),
+                getattr(event, "group", 0),
+                key_event.string,
+            )
 
     def _do_scroll_event(self, event) -> bool:
         if self._client.readonly:
