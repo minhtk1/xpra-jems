@@ -3014,6 +3014,11 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
     def handle_key_press_event(self, _window, event) -> bool:
         key_event = self.parse_key_event(event, True)
         self._log_zenkaku_key(event, key_event, True)
+        # On Windows, skip native zenkaku key events - they are handled by low-level keyboard hook
+        # to avoid double processing and unstable IME toggle behavior
+        if WIN32 and self._is_native_zenkaku_key(event, key_event):
+            zenlog.info("skipping native zenkaku key press in GTK handler (handled by low-level hook)")
+            return True  # Return True to indicate event was handled (by ignoring it)
         if self.moveresize_event and key_event.keyname in BREAK_MOVERESIZE:
             # cancel move resize if there is one:
             self.moveresize_event = None
@@ -3025,8 +3030,68 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
     def handle_key_release_event(self, _window, event) -> bool:
         key_event = self.parse_key_event(event, False)
         self._log_zenkaku_key(event, key_event, False)
+        # On Windows, skip native zenkaku key events - they are handled by low-level keyboard hook
+        # to avoid double processing and unstable IME toggle behavior
+        if WIN32 and self._is_native_zenkaku_key(event, key_event):
+            zenlog.info("skipping native zenkaku key release in GTK handler (handled by low-level hook)")
+            return True  # Return True to indicate event was handled (by ignoring it)
         self._client.handle_key_action(self, key_event)
         return True
+
+    def _is_native_zenkaku_key(self, event, key_event: KeyEvent) -> bool:
+        """Check if this is a native Windows zenkaku key event that should be ignored.
+        Native events have hardware_keycode matching VK_KANA (0x15), VK_OEM_F3 (0xF3), or VK_OEM_ENLW (0xF4).
+        Synthesized events from the low-level hook will have different characteristics (keyval=0xFF2A).
+        """
+        if not WIN32:
+            return False
+        hwcode = getattr(event, "hardware_keycode", 0)
+        keycode = getattr(key_event, "keycode", 0)
+        keyval = getattr(event, "keyval", 0)
+        keyname = (key_event.keyname or "").lower()
+        # VK_KANA is 0x15, which is the native Windows virtual key code for zenkaku key
+        VK_KANA = 0x15
+        VK_OEM_F3 = 0xF3  # Some Japanese keyboards emit this for zenkaku key
+        VK_OEM_ENLW = 0xF4  # Some Japanese keyboards emit this for zenkaku key
+        ZENKAKU_KEYVAL = 0xFF2A  # Synthesized keyval from low-level hook
+        VOID_SYMBOL = 0xFFFFFF  # GTK maps unmapped keys to this
+        
+        # Check hardware keycode - native zenkaku key codes
+        if hwcode in (VK_KANA, VK_OEM_F3, VK_OEM_ENLW):
+            # Only ignore if it's a native event (not synthesized)
+            # Synthesized events have keyval 0xFF2A (ZENKAKU_KEYVAL)
+            if keyval != ZENKAKU_KEYVAL:
+                zenlog.info(
+                    "detected native zenkaku key: hwcode=0x%x keycode=%s keyval=0x%x keyname=%s",
+                    hwcode, keycode, keyval, keyname
+                )
+                return True
+        
+        # Check keycode in key_event - also check this in case hardware_keycode is not set correctly
+        if keycode in (VK_KANA, VK_OEM_F3, VK_OEM_ENLW):
+            # Only ignore if it's a native event (not synthesized)
+            if keyval != ZENKAKU_KEYVAL:
+                zenlog.info(
+                    "detected native zenkaku key by keycode: hwcode=0x%x keycode=%s keyval=0x%x keyname=%s",
+                    hwcode, keycode, keyval, keyname
+                )
+                return True
+        
+        # Check for VoidSymbol (0xFFFFFF) with zenkaku keycodes - GTK maps unmapped keys to this
+        if keyval == VOID_SYMBOL and (hwcode in (VK_KANA, VK_OEM_F3, VK_OEM_ENLW) or 
+                                      keycode in (VK_KANA, VK_OEM_F3, VK_OEM_ENLW)):
+            zenlog.info(
+                "detected native zenkaku key by VoidSymbol: hwcode=0x%x keycode=%s keyval=0x%x keyname=%s",
+                hwcode, keycode, keyval, keyname
+            )
+            return True
+        
+        # Also check for zenkaku-related keynames that come from native Windows events
+        if keyname in {"zenkaku_hankaku", "zenkaku", "hankaku", "kana"}:
+            # Only ignore if it's a native event (not synthesized)
+            if keyval != ZENKAKU_KEYVAL:
+                return True
+        return False
 
     def _log_zenkaku_key(self, event, key_event: KeyEvent, pressed: bool) -> None:
         """Log the Windows 全角／半角 key so we can confirm it is delivered."""

@@ -67,7 +67,7 @@ REINIT_VISIBLE_WINDOWS = envbool("XPRA_WIN32_REINIT_VISIBLE_WINDOWS", True)
 SCREENSAVER_LISTENER_POLL_DELAY = envint("XPRA_SCREENSAVER_LISTENER_POLL_DELAY", 10)
 APP_ID = os.environ.get("XPRA_WIN32_APP_ID", "Xpra")
 MONITOR_DPI = envbool("XPRA_WIN32_MONITOR_DPI", True)
-ZENKAKU_DEBOUNCE_MS = envint("XPRA_ZENKAKU_DEBOUNCE_MS", 1000)
+ZENKAKU_DEBOUNCE_MS = envint("XPRA_ZENKAKU_DEBOUNCE_MS", 300)
 
 PyCapsule_GetPointer = pythonapi.PyCapsule_GetPointer
 PyCapsule_GetPointer.restype = HGDIOBJ
@@ -1180,6 +1180,13 @@ class ClientExtras:
         self._zenkaku_pressed: bool = False
         self._last_focused: int | None = None
         self._last_zenkaku_ms: float = 0.0
+        # Track if last press was skipped due to debounce, so we can handle its release
+        self._last_press_skipped: bool = False
+        # Track last release timestamp to detect Windows' release-then-press pattern
+        self._last_release_ms: float = 0.0
+        self._last_release_vk: int = 0
+        # Flag to track if we skipped a release and are waiting for the corresponding press
+        self._release_skipped_pending_press: bool = False
         class KBDLLHOOKSTRUCT(Structure):
             _fields_ = [
                 ("vk_code", DWORD),
@@ -1242,6 +1249,10 @@ class ClientExtras:
                         self._last_zenkaku_ms,
                         focused,
                     )
+                    # Some keyboards emit both F3 and F4; only synthesize on F4/KANA to avoid double toggle
+                    if vk_code == VK_OEM_F3 and wParam in DOWN:
+                        zenlog.info("skip zenkaku synth on VK_OEM_F3 down to avoid double toggle")
+                        return CallNextHookEx(0, nCode, wParam, lParam)
                     if kh and getattr(kh, "keyboard", None):
                         modifiers: list[str] = []
                         modifier_keycodes = kh.keyboard.modifier_keycodes
@@ -1276,60 +1287,201 @@ class ClientExtras:
                         key_event = KeyEvent()
                         key_event.keyname = "Zenkaku_Hankaku"
                         key_event.pressed = wParam in DOWN
-                        # keep modifiers empty so IME toggle is clean
+                        # send with no modifiers so the server uses the base Zenkaku level
                         key_event.modifiers = []
                         key_event.keyval = ZENKAKU_KEYVAL
                         key_event.keycode = zenkaku_keycode
                         key_event.string = ""
                         key_event.group = zenkaku_group
-                        # only send the press; fcitx/mozc toggles on press, avoid release churn
+                        # Handle key release: send synthesized release event to match the press
                         if not key_event.pressed:
                             if vk_code in (win32con.VK_KANA, VK_OEM_ENLW, VK_OEM_F3):
-                                zenlog.info(
-                                    "zenkaku release: vk=%#x clearing pressed state (was=%s)",
-                                    vk_code,
-                                    self._zenkaku_pressed,
-                                )
-                                self._zenkaku_pressed = False
+                                # Windows pattern: When pressing zenkaku key, Windows sends:
+                                # 1. Release (vk=0xf3) of the previous press
+                                # 2. Press (vk=0xf4) of the new press
+                                # We should NOT send the release if it's immediately followed by a press
+                                # to avoid double toggle (release + press = 2 toggles)
+                                now_ms = monotonic() * 1000.0
+                                self._last_release_ms = now_ms
+                                self._last_release_vk = vk_code
+                                
+                                # Only send release if we previously sent a press
+                                # CRITICAL: On Windows, when pressing zenkaku key, Windows ALWAYS sends:
+                                # 1. Release (vk=0xf3) of the previous press
+                                # 2. Press (vk=0xf4) of the new press (immediately after, same timestamp)
+                                # We should NOT send the release if a press is likely to follow immediately
+                                # to avoid double toggle (release + press = 2 toggles instead of 1)
+                                if self._zenkaku_pressed:
+                                    # CRITICAL FIX: Always skip release if we're in pressed state,
+                                    # because Windows' pattern is ALWAYS release-then-press for zenkaku key.
+                                    # The release here is NOT a real release - it's Windows' way of signaling
+                                    # that a new press is coming. We'll only send the press event.
+                                    # Real releases (when user actually releases the key) will come much later
+                                    # and won't be immediately followed by a press.
+                                    zenlog.info(
+                                        "zenkaku release: vk=%#x skipping (Windows release-then-press pattern - release will be followed by press immediately)",
+                                        vk_code,
+                                    )
+                                    # Don't send release, but consume event
+                                    # CRITICAL: DO NOT reset _zenkaku_pressed here!
+                                    # Keep it True to block duplicate press events that follow immediately
+                                    # It will be reset only when we actually send a real press or after timeout
+                                    self._last_press_skipped = False
+                                    self._release_skipped_pending_press = True
+                                    return 1
+                                    
+                                    target = focused or self._last_focused
+                                    if target:
+                                        zenlog.info(
+                                            "sending synthesized Zenkaku key release: vk=%#x scan=%#x keycode=%s keyval=%#x focused=%s",
+                                            vk_code,
+                                            scan_code,
+                                            zenkaku_keycode,
+                                            ZENKAKU_KEYVAL,
+                                            target,
+                                        )
+                                        kh.send_key_action(target, key_event)
+                                        # Consume the event to prevent GTK from processing it
+                                        self._zenkaku_pressed = False
+                                        self._last_press_skipped = False  # Reset skip flag
+                                        return 1
+                                    else:
+                                        zenlog.info(
+                                            "zenkaku release ignored: no focused window (focused=%s, last_focused=%s)",
+                                            focused, self._last_focused,
+                                        )
+                                        self._zenkaku_pressed = False
+                                        self._last_press_skipped = False  # Reset skip flag
+                                        return 1
+                                else:
+                                    # Check if last press was skipped - if so, skip this release too
+                                    if self._last_press_skipped:
+                                        zenlog.info(
+                                            "zenkaku release: vk=%#x skipping because last press was skipped (was=%s)",
+                                            vk_code,
+                                            self._zenkaku_pressed,
+                                        )
+                                        self._last_press_skipped = False
+                                        # Consume the event to prevent GTK from processing it
+                                        return 1
+                                    zenlog.info(
+                                        "zenkaku release: vk=%#x but no previous press (was=%s), consuming event",
+                                        vk_code,
+                                        self._zenkaku_pressed,
+                                    )
+                                    # Consume the event even if we didn't send a press
+                                    # to prevent GTK from processing orphaned release events
+                                    return 1
+                            # For non-zenkaku keys, let release events pass through
                             return CallNextHookEx(0, nCode, wParam, lParam)
+                        # Handle key press: check for duplicates and debounce
                         now_ms = monotonic() * 1000.0
-                        if key_event.pressed == self._zenkaku_pressed:
+                        
+                        # CRITICAL FIX: Always debounce based on last sent press time
+                        # Don't allow multiple presses within debounce window regardless of release pattern
+                        time_since_last_press = now_ms - self._last_zenkaku_ms
+                        if time_since_last_press < ZENKAKU_DEBOUNCE_MS:
                             zenlog.info(
-                                "skip duplicate zenkaku state=%s vk=%#x scan=%#x (pressed=%s delta=%.0fms)",
-                                key_event.pressed,
+                                "skip zenkaku press within debounce: delta=%.0fms threshold=%sms (pressed=%s)",
+                                time_since_last_press, 
+                                ZENKAKU_DEBOUNCE_MS,
+                                self._zenkaku_pressed,
+                            )
+                            # Mark that we skipped a press, so we can skip its release too
+                            self._last_press_skipped = True
+                            # Still consume the event to prevent GTK from processing it
+                            return 1
+                        
+                        # Check if we're already in pressed state (duplicate press without proper release)
+                        # This catches cases where multiple presses come without releases
+                        if self._zenkaku_pressed:
+                            zenlog.info(
+                                "skip duplicate zenkaku press: vk=%#x scan=%#x (already in pressed state, delta=%.0fms)",
                                 vk_code,
                                 scan_code,
-                                self._zenkaku_pressed,
-                                now_ms - self._last_zenkaku_ms,
+                                time_since_last_press,
                             )
-                            return CallNextHookEx(0, nCode, wParam, lParam)
-                        if now_ms - self._last_zenkaku_ms < ZENKAKU_DEBOUNCE_MS:
+                            # Mark that we skipped a press, so we can skip its release too
+                            self._last_press_skipped = True
+                            # Still consume the event to prevent GTK from processing it
+                            return 1
+                        # Check timeout: auto-reset pressed state if too much time has passed
+                        # This handles cases where release event was never received
+                        ZENKAKU_TIMEOUT_MS = 500.0
+                        if self._zenkaku_pressed and time_since_last_press > ZENKAKU_TIMEOUT_MS:
                             zenlog.info(
-                                "skip zenkaku within debounce: delta=%.0fms threshold=%sms",
-                                now_ms - self._last_zenkaku_ms, ZENKAKU_DEBOUNCE_MS,
+                                "zenkaku auto-reset: timeout %.0fms exceeded, resetting pressed state",
+                                time_since_last_press,
                             )
-                            return CallNextHookEx(0, nCode, wParam, lParam)
+                            self._zenkaku_pressed = False
+                        
+                        # Reset skip flag since we're processing this press
+                        self._last_press_skipped = False
+                        # Clear release-skipped flag since we're sending the corresponding press
+                        self._release_skipped_pending_press = False
+                        # Update state BEFORE sending to ensure we don't process duplicates
                         self._last_zenkaku_ms = now_ms
-                        self._zenkaku_pressed = key_event.pressed
+                        self._zenkaku_pressed = True
+                        # Clear release tracking since we're sending a press
+                        self._last_release_ms = 0.0
+                        self._last_release_vk = 0
                         zenlog.info(
-                            "sending synthesized Zenkaku key: vk=%#x scan=%#x down=%s mods=%s keycode=%s keyval=%#x group=%s focused=%s",
+                            "sending synthesized Zenkaku key press (release will follow after 50ms): vk=%#x scan=%#x keycode=%s keyval=%#x focused=%s",
                             vk_code,
                             scan_code,
-                            key_event.pressed,
-                            modifiers,
-                            key_event.keycode,
-                            key_event.keyval,
-                            key_event.group,
+                            zenkaku_keycode,
+                            ZENKAKU_KEYVAL,
                             focused or self._last_focused,
                         )
                         target = focused or self._last_focused
                         if target:
-                            kh.send_key_action(target, key_event)
+                            # CRITICAL FIX: Send press event, then schedule release after delay
+                            # This ensures fcitx5/IBus receives a complete key press cycle
+                            # with proper timing to recognize it as a single key press
+                            
+                            # Send press event
+                            press_event = KeyEvent()
+                            press_event.keyname = "Zenkaku_Hankaku"
+                            press_event.pressed = True
+                            press_event.modifiers = []
+                            press_event.keyval = ZENKAKU_KEYVAL
+                            press_event.keycode = zenkaku_keycode
+                            press_event.string = ""
+                            press_event.group = zenkaku_group
+                            kh.send_key_action(target, press_event)
+                            
+                            # Schedule release event after 50ms delay
+                            def send_release():
+                                release_event = KeyEvent()
+                                release_event.keyname = "Zenkaku_Hankaku"
+                                release_event.pressed = False
+                                release_event.modifiers = []
+                                release_event.keyval = ZENKAKU_KEYVAL
+                                release_event.keycode = zenkaku_keycode
+                                release_event.string = ""
+                                release_event.group = zenkaku_group
+                                kh.send_key_action(target, release_event)
+                                zenlog.info("sent Zenkaku key release (delayed)")
+                                # Reset pressed state after sending release
+                                self._zenkaku_pressed = False
+                                return False  # Don't repeat timer
+                            
+                            GLib.timeout_add(50, send_release)
+                            
+                            zenlog.info("sent Zenkaku key press, release scheduled after 50ms")
+                            # Event was consumed and synthesized key was sent
+                            # Keep pressed=True until release is sent
                             return 1
+                        # No focused window - reset pressed state but keep timestamp for debounce
+                        # This ensures next press (when window has focus) won't be incorrectly skipped
                         zenlog.info(
-                            "zenkaku key ignored: no focused window (focused=%s, last_focused=%s)",
+                            "zenkaku key ignored: no focused window (focused=%s, last_focused=%s), resetting pressed state",
                             focused, self._last_focused,
                         )
+                        self._zenkaku_pressed = False
+                        self._last_press_skipped = False  # Reset skip flag
+                        # Still consume the event to prevent GTK from processing it
+                        return 1
                     else:
                         zenlog.info(
                             "zenkaku key ignored: missing keyboard_helper or keyboard (kh=%s)",
