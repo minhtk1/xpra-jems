@@ -433,7 +433,31 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         widget.show()
         self.drawing_area = widget
         self.init_widget_events(widget)
-        self.add(widget)
+        
+        # PATCH: Tạo Gtk.Overlay để che flash màu đen ban đầu
+        # Khi cửa sổ mới được tạo, thường có flash đen <0.5s trước khi
+        # nội dung thật được vẽ. Overlay này che flash đó bằng màu #EEF9F3
+        self.overlay_container = Gtk.Overlay()
+        self.overlay_container.add(widget)
+        
+        # Tạo overlay widget với màu #EEF9F3 (nền sáng mint nhạt)
+        self.loading_overlay = Gtk.EventBox()
+        self.loading_overlay.set_size_request(*self._size)
+        rgba = Gdk.RGBA()
+        rgba.parse("#EEF9F3")
+        self.loading_overlay.override_background_color(Gtk.StateFlags.NORMAL, rgba)
+        self.loading_overlay.show()
+        self.overlay_container.add_overlay(self.loading_overlay)
+        
+        # Track trạng thái overlay
+        self._overlay_visible = True
+        self._first_frame_received = False
+        self._frame_count = 0  # Đếm số frame nhận được
+        
+        # Timeout fallback: tự động gỡ overlay sau 2.5s nếu không nhận frame
+        self._overlay_timeout = GLib.timeout_add(2500, self._remove_loading_overlay_fallback)
+        
+        self.add(self.overlay_container)
 
     def repaint(self, x: int, y: int, w: int, h: int) -> None:
         if OSX:
@@ -443,6 +467,76 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         # log("repaint%s widget=%s", (x, y, w, h), widget)
         if widget:
             widget.queue_draw_area(x, y, w, h)
+    
+    def _remove_loading_overlay(self) -> None:
+        """
+        PATCH: Gỡ overlay loading màu #EEF9F3
+        Được gọi khi nhận frame đầu tiên từ server hoặc timeout fallback
+        """
+        if not self._overlay_visible:
+            return  # Đã gỡ rồi
+        
+        self._overlay_visible = False
+        self._first_frame_received = True
+        
+        # Cancel timeout nếu còn đang chạy
+        if self._overlay_timeout:
+            GLib.source_remove(self._overlay_timeout)
+            self._overlay_timeout = 0
+        
+        # Ẩn overlay widget
+        if self.loading_overlay:
+            self.loading_overlay.hide()
+            # Có thể remove hoàn toàn khỏi container nếu muốn
+            # self.overlay_container.remove(self.loading_overlay)
+            # self.loading_overlay = None
+    
+    def _remove_loading_overlay_fallback(self) -> bool:
+        """
+        PATCH: Timeout fallback để tự động gỡ overlay sau 2.5s
+        Trường hợp này xảy ra nếu:
+        - Mạng chậm và không nhận được frame đầu tiên
+        - Bug/lỗi khiến không có frame nào được gửi
+        Trả về False để không lặp lại timeout
+        """
+        if self._overlay_visible:
+            log("Loading overlay timeout reached after %d frames, removing overlay", self._frame_count)
+            self._remove_loading_overlay()
+        self._overlay_timeout = 0
+        return False  # Không lặp lại
+    
+    def draw_region(self, x: int, y: int, width: int, height: int,
+                    coding: str, img_data, rowstride: int,
+                    options: typedict, callbacks):
+        """
+        PATCH: Override draw_region để gỡ overlay sau khi nhận đủ frames
+        Đợi 2-3 frames VÀ thêm delay 250ms để đảm bảo nội dung đã vẽ hoàn chỉnh
+        trước khi gỡ overlay, tránh vẫn thấy flash đen
+        """
+        # Đếm frame (chỉ đếm frame có nội dung thật, không đếm "void")
+        if self._overlay_visible and coding != "void":
+            self._frame_count += 1
+            
+            # Đợi ít nhất 2 frames trước khi gỡ overlay
+            # (frame đầu có thể chưa vẽ đầy đủ)
+            if self._frame_count >= 2:
+                # Thêm delay 250ms để chắc chắn nội dung đã được render
+                # trước khi gỡ overlay - tránh flash đen
+                if not self._first_frame_received:
+                    self._first_frame_received = True
+                    GLib.timeout_add(250, self._remove_loading_overlay_delayed)
+        
+        # Gọi implementation gốc từ ClientWindowBase
+        return super().draw_region(x, y, width, height, coding, img_data, rowstride, options, callbacks)
+    
+    def _remove_loading_overlay_delayed(self) -> bool:
+        """
+        PATCH: Gỡ overlay sau delay 250ms kể từ khi nhận đủ frames
+        Đảm bảo GTK đã vẽ nội dung lên màn hình trước khi gỡ overlay
+        """
+        if self._overlay_visible:
+            self._remove_loading_overlay()
+        return False  # Không lặp lại
 
     def get_window_event_mask(self) -> Gdk.EventMask:
         mask = WINDOW_EVENT_MASK
