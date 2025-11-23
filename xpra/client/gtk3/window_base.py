@@ -510,21 +510,30 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                     options: typedict, callbacks):
         """
         PATCH: Override draw_region để gỡ overlay sau khi nhận đủ frames
-        Đợi 2-3 frames VÀ thêm delay 250ms để đảm bảo nội dung đã vẽ hoàn chỉnh
-        trước khi gỡ overlay, tránh vẫn thấy flash đen
+        - Cửa sổ nhỏ (popup, IME tooltip): delay 100ms, chỉ cần 1 frame
+        - Cửa sổ bình thường: delay 250ms, cần 3 frames
         """
         # Đếm frame (chỉ đếm frame có nội dung thật, không đếm "void")
         if self._overlay_visible and coding != "void":
             self._frame_count += 1
             
-            # Đợi ít nhất 2 frames trước khi gỡ overlay
-            # (frame đầu có thể chưa vẽ đầy đủ)
-            if self._frame_count >= 2:
-                # Thêm delay 250ms để chắc chắn nội dung đã được render
-                # trước khi gỡ overlay - tránh flash đen
-                if not self._first_frame_received:
-                    self._first_frame_received = True
-                    GLib.timeout_add(250, self._remove_loading_overlay_delayed)
+            # Phát hiện popup nhỏ (IME candidate, tooltip, etc)
+            # Dựa trên kích thước và window type
+            ww, wh = self._size
+            is_small_popup = (ww < 300 and wh < 300) or self.is_OR()
+            
+            if is_small_popup:
+                # Popup nhỏ (IME tooltip): gỡ nhanh sau 1 frame + 100ms
+                if self._frame_count >= 1:
+                    if not self._first_frame_received:
+                        self._first_frame_received = True
+                        GLib.timeout_add(100, self._remove_loading_overlay_delayed)
+            else:
+                # Cửa sổ bình thường: đợi 3 frames + 250ms
+                if self._frame_count >= 3:
+                    if not self._first_frame_received:
+                        self._first_frame_received = True
+                        GLib.timeout_add(250, self._remove_loading_overlay_delayed)
         
         # Gọi implementation gốc từ ClientWindowBase
         return super().draw_region(x, y, width, height, coding, img_data, rowstride, options, callbacks)
