@@ -509,16 +509,15 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                     coding: str, img_data, rowstride: int,
                     options: typedict, callbacks):
         """
-        PATCH: Override draw_region để gỡ overlay sau khi nhận đủ frames
-        - Cửa sổ nhỏ (popup, IME tooltip): delay 100ms, chỉ cần 1 frame
-        - Cửa sổ bình thường: delay 250ms, cần 3 frames
+        PATCH: Override draw_region để gỡ overlay khi nội dung không còn đen
+        - Popup nhỏ: gỡ nhanh, chỉ cần 1 frame
+        - Cửa sổ bình thường: kiểm tra % pixel đen < 30% mới gỡ
         """
         # Đếm frame (chỉ đếm frame có nội dung thật, không đếm "void")
         if self._overlay_visible and coding != "void":
             self._frame_count += 1
             
             # Phát hiện popup nhỏ (IME candidate, tooltip, etc)
-            # Dựa trên kích thước và window type
             ww, wh = self._size
             is_small_popup = (ww < 300 and wh < 300) or self.is_OR()
             
@@ -529,18 +528,78 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                         self._first_frame_received = True
                         GLib.timeout_add(100, self._remove_loading_overlay_delayed)
             else:
-                # Cửa sổ bình thường: đợi 3 frames + 250ms
-                if self._frame_count >= 3:
-                    if not self._first_frame_received:
-                        self._first_frame_received = True
-                        GLib.timeout_add(250, self._remove_loading_overlay_delayed)
+                # Cửa sổ bình thường: đợi ít nhất 2 frames rồi kiểm tra % đen
+                if self._frame_count >= 2:
+                    # Kiểm tra xem nội dung có còn đen không
+                    black_percentage = self._check_black_percentage(img_data, width, height, coding, rowstride)
+                    if black_percentage < 30:  # Nếu < 30% là đen → có nội dung thật
+                        if not self._first_frame_received:
+                            self._first_frame_received = True
+                            GLib.timeout_add(250, self._remove_loading_overlay_delayed)
         
         # Gọi implementation gốc từ ClientWindowBase
         return super().draw_region(x, y, width, height, coding, img_data, rowstride, options, callbacks)
     
+    def _check_black_percentage(self, img_data, width: int, height: int, 
+                                 coding: str, rowstride: int) -> float:
+        """
+        PATCH: Kiểm tra % pixel đen trong frame
+        Sample một số pixel để tính nhanh, không cần check toàn bộ
+        Trả về: % pixel đen (0-100)
+        """
+        try:
+            # Chỉ check với RGB/RGBA formats
+            if coding not in ("rgb24", "rgb32", "rgba", "rgbx"):
+                return 0  # Không phải RGB, coi như không đen
+            
+            if not img_data or width <= 0 or height <= 0:
+                return 100  # Data rỗng, coi như đen
+            
+            # Xác định bytes per pixel
+            if coding in ("rgb24",):
+                bpp = 3
+            else:  # rgb32, rgba, rgbx
+                bpp = 4
+            
+            # Sample 100 pixel (grid 10x10) để tính nhanh
+            sample_size = 10
+            step_x = max(1, width // sample_size)
+            step_y = max(1, height // sample_size)
+            
+            black_count = 0
+            total_count = 0
+            
+            # Nếu img_data là bytes/bytearray/memoryview
+            if isinstance(img_data, (bytes, bytearray, memoryview)):
+                data = img_data if isinstance(img_data, (bytes, bytearray)) else bytes(img_data)
+                
+                for y in range(0, height, step_y):
+                    for x in range(0, width, step_x):
+                        offset = y * rowstride + x * bpp
+                        if offset + bpp <= len(data):
+                            r = data[offset]
+                            g = data[offset + 1]
+                            b = data[offset + 2]
+                            
+                            # Pixel "đen" nếu R,G,B đều < 30
+                            if r < 30 and g < 30 and b < 30:
+                                black_count += 1
+                            total_count += 1
+            
+            if total_count == 0:
+                return 100
+            
+            return (black_count / total_count) * 100
+            
+        except Exception as e:
+            # Nếu có lỗi gì, coi như không đen (để gỡ overlay)
+            log("Error checking black percentage: %s", e)
+            return 0
+    
     def _remove_loading_overlay_delayed(self) -> bool:
         """
-        PATCH: Gỡ overlay sau delay 250ms kể từ khi nhận đủ frames
+        PATCH: Gỡ overlay sau delay 250ms
+        Được gọi khi phát hiện nội dung không còn đen (< 30% pixel đen)
         Đảm bảo GTK đã vẽ nội dung lên màn hình trước khi gỡ overlay
         """
         if self._overlay_visible:
