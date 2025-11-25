@@ -155,6 +155,11 @@ SMOOTH_SCROLL = envbool("XPRA_SMOOTH_SCROLL", True)
 POLL_WORKSPACE = envbool("XPRA_POLL_WORKSPACE", CAN_SET_WORKSPACE)
 ICONIFY_LATENCY = envint("XPRA_ICONIFY_LATENCY", 150)
 SMOOTH_SCROLL_NORM = envint("XPRA_SMOOTH_SCROLL_NORM", 50 if OSX else 100)
+OVERLAY_TIMEOUT_MS = envint("XPRA_OVERLAY_TIMEOUT", 2500)
+OVERLAY_MIN_FLUSHES = max(1, envint("XPRA_OVERLAY_MIN_FLUSHES", 2))
+OVERLAY_MIN_FLUSHES_SMALL = max(1, envint("XPRA_OVERLAY_MIN_FLUSHES_SMALL", 1))
+OVERLAY_MIN_DURATION_MS = max(0, envint("XPRA_OVERLAY_MIN_DURATION", 750))
+OVERLAY_LOG = envbool("XPRA_OVERLAY_DEBUG", False)
 
 WINDOW_OVERFLOW_TOP = envbool("XPRA_WINDOW_OVERFLOW_TOP", False)
 AWT_RECENTER = envbool("XPRA_AWT_RECENTER", True)
@@ -387,6 +392,16 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self._first_frame_received = False
         self._frame_count = 0
         self._overlay_timeout = 0
+        # PATCH: Track painted regions for smart overlay removal
+        # Use a list of rectangles to track which areas have been painted
+        self._painted_regions = []  # List of (x, y, w, h) tuples
+        self._coverage_grid: set[tuple[int, int]] = set()
+        self._coverage_check_timer = 0
+        self._completed_flushes = 0
+        self._waiting_for_flush_completion = False
+        self._saw_flush_value = False
+        self._overlay_last_status = ""
+        self._overlay_created_time = monotonic()
         self.init_drawing_area()
         self.set_decorated(self._is_decorated(metadata))
         self._window_state = {}
@@ -458,11 +473,13 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self._overlay_visible = True
         self._first_frame_received = False
         self._frame_count = 0  # Number of frames received
+        self._overlay_created_time = monotonic()
 
         # Timeout fallback: remove the overlay after 2.5s if no frame arrives
-        self._overlay_timeout = GLib.timeout_add(2500, self._remove_loading_overlay_fallback)
+        self._overlay_timeout = GLib.timeout_add(OVERLAY_TIMEOUT_MS, self._remove_loading_overlay_fallback)
 
         self.add(self.overlay_container)
+        self._reset_overlay_tracking()
 
     def repaint(self, x: int, y: int, w: int, h: int) -> None:
         if OSX:
@@ -476,7 +493,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
     def _remove_loading_overlay(self) -> None:
         """
         PATCH: Remove the mint loading overlay.
-        Called when the first frame arrives or when the fallback timeout fires.
+        Called when sufficient coverage is achieved or when the fallback timeout fires.
         """
         if not self._overlay_visible:
             return  # Already removed
@@ -489,12 +506,54 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             GLib.source_remove(self._overlay_timeout)
             self._overlay_timeout = 0
         
+        # Cancel coverage check timer if running
+        if self._coverage_check_timer:
+            GLib.source_remove(self._coverage_check_timer)
+            self._coverage_check_timer = 0
+
+        self._reset_overlay_tracking()
+
         # Hide the overlay widget
         if self.loading_overlay:
             self.loading_overlay.hide()
             # Could remove it entirely from the container if needed
             # self.overlay_container.remove(self.loading_overlay)
             # self.loading_overlay = None
+
+    def _reset_overlay_tracking(self) -> None:
+        """
+        PATCH: Reset overlay coverage bookkeeping so we only hide the overlay after a full paint.
+        """
+        self._painted_regions = []
+        self._coverage_grid.clear()
+        self._completed_flushes = 0
+        self._waiting_for_flush_completion = False
+        self._saw_flush_value = False
+        self._overlay_last_status = ""
+        self._frame_count = 0
+        self._overlay_created_time = monotonic()
+
+    def _overlay_reset_measurements(self) -> None:
+        """
+        PATCH: Reset overlay timers and measurements when geometry or content changes.
+        """
+        if not self._overlay_visible:
+            return
+        if self._coverage_check_timer:
+            GLib.source_remove(self._coverage_check_timer)
+            self._coverage_check_timer = 0
+        self._reset_overlay_tracking()
+
+    def _overlay_log(self, message: str, *args) -> None:
+        """
+        PATCH: Optional debug logging for overlay decisions.
+        """
+        if OVERLAY_LOG:
+            log.info("overlay[%s] " + message, self.wid, *args)
+
+    def _is_small_overlay_window(self) -> bool:
+        ww, wh = self._size
+        return (ww < 300 and wh < 300) or self.is_OR()
     
     def _remove_loading_overlay_fallback(self) -> bool:
         """
@@ -504,9 +563,31 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         - A bug prevents any frames from being sent
         Returns False to avoid repeating the timeout.
         """
-        if self._overlay_visible:
-            log("Loading overlay timeout reached after %d frames, removing overlay", self._frame_count)
-            self._remove_loading_overlay()
+        if not self._overlay_visible:
+            self._overlay_timeout = 0
+            return False
+        is_small_popup = self._is_small_overlay_window()
+        required_flushes = OVERLAY_MIN_FLUSHES_SMALL if is_small_popup else OVERLAY_MIN_FLUSHES
+        elapsed = (monotonic() - self._overlay_created_time) * 1000
+        if elapsed < OVERLAY_MIN_DURATION_MS:
+            wait_ms = OVERLAY_MIN_DURATION_MS - int(elapsed)
+            self._overlay_log("timeout reached but minimum duration %dms not met (elapsed=%dms)",
+                              OVERLAY_MIN_DURATION_MS, int(elapsed))
+            self._overlay_timeout = GLib.timeout_add(max(OVERLAY_TIMEOUT_MS, wait_ms),
+                                                     self._remove_loading_overlay_fallback)
+            return False
+        if self._frame_count == 0:
+            self._overlay_log("timeout but no frames decoded yet; keeping overlay")
+            self._overlay_timeout = GLib.timeout_add(OVERLAY_TIMEOUT_MS, self._remove_loading_overlay_fallback)
+            return False
+        if self._saw_flush_value and self._completed_flushes < required_flushes:
+            self._overlay_log("timeout but only %d/%d flushes complete; keeping overlay",
+                              self._completed_flushes, required_flushes)
+            self._overlay_timeout = GLib.timeout_add(OVERLAY_TIMEOUT_MS, self._remove_loading_overlay_fallback)
+            return False
+        self._overlay_log("timeout removing overlay after %d frames and %d flushes",
+                          self._frame_count, self._completed_flushes)
+        self._remove_loading_overlay()
         self._overlay_timeout = 0
         return False  # Do not repeat
     
@@ -514,36 +595,202 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                     coding: str, img_data, rowstride: int,
                     options: typedict, callbacks):
         """
-        PATCH: Override draw_region to remove the overlay once content is visible.
-        - Small popups: remove quickly after one frame
-        - Regular windows: wait until black pixels drop below 30%
+        PATCH: Override draw_region to track painted regions and remove overlay when coverage is sufficient.
+        Uses smart coverage tracking instead of black pixel detection.
         """
-        # Count frames with real content (ignore "void" frames)
+        # Track painted regions for overlay removal (ignore "void" frames)
         if self._overlay_visible and coding != "void":
-            self._frame_count += 1
-            
-            # Detect small popups (IME candidate, tooltip, etc)
-            ww, wh = self._size
-            is_small_popup = (ww < 300 and wh < 300) or self.is_OR()
-            
-            if is_small_popup:
-                # Small popups (IME tooltip): remove quickly after 1 frame + 100ms
-                if self._frame_count >= 1:
-                    if not self._first_frame_received:
-                        self._first_frame_received = True
-                        GLib.timeout_add(100, self._remove_loading_overlay_delayed)
+            flush_value = -1
+            if hasattr(options, "intget"):
+                flush_value = options.intget("flush", -1)
+            elif isinstance(options, dict):
+                flush_value = int(options.get("flush", -1))
+            if flush_value >= 0:
+                self._saw_flush_value = True
+                if flush_value == 0:
+                    if self._waiting_for_flush_completion:
+                        self._waiting_for_flush_completion = False
+                    self._completed_flushes += 1
+                    if OVERLAY_LOG:
+                        self._overlay_log("flush #%d complete after %d frames, coverage=%.1f%%",
+                                          self._completed_flushes, self._frame_count,
+                                          self._calculate_coverage() * 100.0)
+                else:
+                    self._waiting_for_flush_completion = True
             else:
-                # Regular windows: wait at least 2 frames then check the black percentage
-                if self._frame_count >= 2:
-                    # Check if the content is still mostly black
-                    black_percentage = self._check_black_percentage(img_data, width, height, coding, rowstride)
-                    if black_percentage < 30:  # If <30% of pixels are black, assume the real content is visible
-                        if not self._first_frame_received:
-                            self._first_frame_received = True
-                            GLib.timeout_add(250, self._remove_loading_overlay_delayed)
+                self._waiting_for_flush_completion = False
+            self._frame_count += 1
+            # Add this region to painted regions
+            self._add_painted_region(x, y, width, height)
+            
+            # Add callback to check coverage after paint completes
+            if callbacks:
+                # Wrap existing callbacks to check coverage after paint
+                original_callbacks = list(callbacks)
+                def check_coverage_after_paint(success, message=""):
+                    # Call original callbacks first
+                    for cb in original_callbacks:
+                        try:
+                            cb(success, message)
+                        except Exception:
+                            pass
+                    # Then check coverage after paint completes successfully
+                    if success:
+                        GLib.idle_add(self._check_coverage_and_remove_overlay)
+                
+                # Replace callbacks with wrapped version (safe modification)
+                if isinstance(callbacks, list):
+                    callbacks.clear()
+                    callbacks.append(check_coverage_after_paint)
+                else:
+                    # If callbacks is not a list, create a new list
+                    # This shouldn't happen, but be safe
+                    callbacks = [check_coverage_after_paint]
+            else:
+                # No callbacks, check coverage directly after a short delay
+                if not self._coverage_check_timer:
+                    self._coverage_check_timer = GLib.timeout_add(50, self._check_coverage_and_remove_overlay)
         
         # Call the base implementation from ClientWindowBase
         return super().draw_region(x, y, width, height, coding, img_data, rowstride, options, callbacks)
+    
+    def _add_painted_region(self, x: int, y: int, w: int, h: int) -> None:
+        """
+        PATCH: Add a painted region to the tracking list.
+        Merges overlapping regions to reduce memory usage.
+        """
+        if w <= 0 or h <= 0:
+            return
+        
+        new_region = (x, y, w, h)
+        
+        # Simple merge: if new region overlaps significantly with existing ones, merge them
+        # For efficiency, we use a simple grid-based approach for large windows
+        ww, wh = self._size
+        if ww > 0 and wh > 0:
+            # For very large windows, use a grid to track coverage
+            if ww * wh > 1000000:  # > 1MP
+                # Use 16x16 grid (256 cells) to track coverage
+                grid_size = 16
+                cell_w = (ww + grid_size - 1) // grid_size
+                cell_h = (wh + grid_size - 1) // grid_size
+                # Mark cells covered by this region
+                coverage_grid = self._coverage_grid
+                start_cell_x = max(0, x // cell_w)
+                end_cell_x = min(grid_size - 1, (x + w - 1) // cell_w)
+                start_cell_y = max(0, y // cell_h)
+                end_cell_y = min(grid_size - 1, (y + h - 1) // cell_h)
+
+                for cy in range(start_cell_y, end_cell_y + 1):
+                    for cx in range(start_cell_x, end_cell_x + 1):
+                        coverage_grid.add((cx, cy))
+            else:
+                # For smaller windows, track exact regions
+                # Simple approach: just add the region (could be optimized with region merging)
+                self._painted_regions.append(new_region)
+    
+    def _check_coverage_and_remove_overlay(self) -> bool:
+        """
+        PATCH: Check if enough of the window has been painted to remove the overlay.
+        Returns True if timer should continue, False to stop.
+        """
+        if not self._overlay_visible:
+            self._coverage_check_timer = 0
+            return False
+        
+        ww, wh = self._size
+        if ww <= 0 or wh <= 0:
+            self._coverage_check_timer = 0
+            return False
+        
+        total_area = ww * wh
+        if total_area == 0:
+            self._coverage_check_timer = 0
+            return False
+        
+        # Check coverage
+        coverage = self._calculate_coverage()
+        
+        # Detect small popups (IME candidate, tooltip, etc) - remove quickly
+        is_small_popup = self._is_small_overlay_window()
+        coverage_threshold = 0.95 if is_small_popup else 0.985
+        flush_ready = (not self._saw_flush_value) or (not self._waiting_for_flush_completion)
+        required_flushes = OVERLAY_MIN_FLUSHES_SMALL if is_small_popup else OVERLAY_MIN_FLUSHES
+        flush_count_ready = (not self._saw_flush_value) or (self._completed_flushes >= required_flushes)
+        if coverage >= coverage_threshold and not self._first_frame_received:
+            elapsed = (monotonic() - self._overlay_created_time) * 1000
+            if elapsed < OVERLAY_MIN_DURATION_MS:
+                if OVERLAY_LOG and self._overlay_last_status != "waiting-min-duration":
+                    self._overlay_last_status = "waiting-min-duration"
+                    self._overlay_log(
+                        "coverage %.1f%% met but waiting minimum duration (%d/%d ms)",
+                        coverage * 100.0, int(elapsed), OVERLAY_MIN_DURATION_MS)
+                return True
+            if flush_ready and flush_count_ready:
+                self._first_frame_received = True
+                delay = 100 if is_small_popup else 150
+                self._overlay_log(
+                    "coverage %.1f%% reached with %d flushes after %d frames, scheduling overlay removal in %dms",
+                    coverage * 100.0, self._completed_flushes, self._frame_count, delay)
+                self._overlay_last_status = ""
+                GLib.timeout_add(delay, self._remove_loading_overlay_delayed)
+                self._coverage_check_timer = 0
+                return False
+            if OVERLAY_LOG:
+                if self._waiting_for_flush_completion and self._saw_flush_value:
+                    reason = "waiting for final damage flush"
+                elif not flush_count_ready and self._saw_flush_value:
+                    reason = f"waiting for {required_flushes} flushes (have {self._completed_flushes})"
+                elif self._overlay_last_status == "waiting-min-duration":
+                    reason = "waiting minimum duration"
+                else:
+                    reason = "waiting for implicit flush confirmation"
+                if reason != self._overlay_last_status:
+                    self._overlay_last_status = reason
+                    self._overlay_log(
+                        "%s (coverage=%.1f%%, frames=%d, flushes=%d, saw_flush=%s)",
+                        reason, coverage * 100.0, self._frame_count,
+                        self._completed_flushes, self._saw_flush_value)
+
+        # Continue checking
+        return True
+    
+    def _calculate_coverage(self) -> float:
+        """
+        PATCH: Calculate the percentage of window area that has been painted.
+        Returns a value between 0.0 and 1.0.
+        """
+        ww, wh = self._size
+        if ww <= 0 or wh <= 0:
+            return 0.0
+        
+        total_area = ww * wh
+        
+        # Use grid-based approach for large windows
+        if self._coverage_grid:
+            grid_size = 16
+            covered_cells = len(self._coverage_grid)
+            total_cells = grid_size * grid_size
+            return covered_cells / total_cells if total_cells > 0 else 0.0
+        
+        # For smaller windows, calculate union of painted regions
+        if not self._painted_regions:
+            return 0.0
+        
+        # Simple approximation: sum of all region areas (may overcount overlaps)
+        # For better accuracy, we could use a proper region union algorithm
+        painted_area = 0
+        for x, y, w, h in self._painted_regions:
+            # Clamp to window bounds
+            x1 = max(0, min(ww, x))
+            y1 = max(0, min(wh, y))
+            x2 = max(0, min(ww, x + w))
+            y2 = max(0, min(wh, y + h))
+            painted_area += (x2 - x1) * (y2 - y1)
+        
+        # Cap at total area (to handle overlaps)
+        painted_area = min(painted_area, total_area)
+        return painted_area / total_area if total_area > 0 else 0.0
     
     def _check_black_percentage(self, img_data, width: int, height: int, 
                                  coding: str, rowstride: int) -> float:
@@ -2914,6 +3161,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             self.new_backing(bw, bh)
 
     def resize(self, w: int, h: int, resize_counter: int = 0) -> None:
+        self._overlay_reset_measurements()
         ww, wh = self.get_size()
         geomlog("resize(%s, %s, %s) current size=%s, fullscreen=%s, maximized=%s",
                 w, h, resize_counter, (ww, wh), self._fullscreen, self._maximized)
@@ -2978,7 +3226,8 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
 
     def move_resize(self, x: int, y: int, w: int, h: int, resize_counter: int = 0) -> None:
         geomlog("window %i move_resize%s", self.wid, (x, y, w, h, resize_counter))
-        
+        self._overlay_reset_measurements()
+
         # PATCH: Skip moving Wine popup menus; only resize when necessary
         # Wine popup menus use absolute positions from the server, so avoid moving them
         is_wine_popup = self._is_wine_popup_menu() if self.is_OR() else False
