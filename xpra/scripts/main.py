@@ -2247,7 +2247,7 @@ def make_client(opts):
     progress_process = None
     if opts.splash is not False:
         from xpra import __version__
-        progress_process = make_progress_process("Xpra Client v%s" % __version__)
+        progress_process = make_progress_process("KankyouShougunR Cloud")
 
     try:
         check_gtk_client()

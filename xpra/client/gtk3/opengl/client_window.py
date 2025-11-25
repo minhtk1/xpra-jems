@@ -11,6 +11,11 @@ from xpra.gtk.window import set_visual
 from xpra.util.objects import typedict
 from xpra.util.env import envbool
 from xpra.log import Logger
+from xpra.os_util import gi_import
+
+GLib = gi_import("GLib")
+Gtk = gi_import("Gtk")
+Gdk = gi_import("Gdk")
 
 log = Logger("opengl", "window")
 
@@ -56,7 +61,11 @@ class GLClientWindowBase(ClientWindow):
             # re-create the drawing area,
             # which will re-create the opengl context:
             try:
-                self.remove(da)
+                # PATCH: Remove from overlay container if it exists
+                if self.overlay_container:
+                    self.overlay_container.remove(da)
+                else:
+                    self.remove(da)
             except Exception:
                 log("monitor_changed: failed to remove %s", da)
             self.drawing_area = None
@@ -74,7 +83,11 @@ class GLClientWindowBase(ClientWindow):
             log("remove_backing() glarea=%s", glarea)
             if glarea:
                 try:
-                    self.remove(glarea)
+                    # PATCH: Remove from overlay container if it exists
+                    if self.overlay_container:
+                        self.overlay_container.remove(glarea)
+                    else:
+                        self.remove(glarea)
                 except Exception:
                     log.warn("Warning: cannot remove %s", glarea, exc_info=True)
 
@@ -112,8 +125,17 @@ class GLClientWindowBase(ClientWindow):
 
     def new_backing(self, bw: int, bh: int) -> None:
         widget = super().new_backing(bw, bh)
+        
+        # PATCH: Handle overlay container for OpenGL windows
+        # Remove old widget from overlay container or window
         if self.drawing_area:
-            self.remove(self.drawing_area)
+            if self.overlay_container:
+                # Remove from overlay container if it exists
+                self.overlay_container.remove(self.drawing_area)
+            else:
+                # Remove from window directly
+                self.remove(self.drawing_area)
+        
         set_visual(widget, self._has_alpha)
         widget.show()
         self.init_widget_events(widget)
@@ -122,7 +144,39 @@ class GLClientWindowBase(ClientWindow):
             thints = typedict(self.size_constraints)
             minsize = thints.intpair("minimum-size", (0, 0))
             self.drawing_area.set_size_request(*minsize)
-        self.add(widget)
+        
+        # PATCH: Create overlay container if it doesn't exist (for OpenGL windows)
+        if not self.overlay_container:
+            # Create overlay container
+            self.overlay_container = Gtk.Overlay()
+            self.overlay_container.add(widget)
+            
+            # Create loading overlay with color #EEF9F3
+            self.loading_overlay = Gtk.EventBox()
+            self.loading_overlay.set_size_request(*self._size)
+            rgba = Gdk.RGBA()
+            rgba.parse("#EEF9F3")
+            self.loading_overlay.override_background_color(Gtk.StateFlags.NORMAL, rgba)
+            self.loading_overlay.show()
+            self.overlay_container.add_overlay(self.loading_overlay)
+            
+            # Track overlay state
+            self._overlay_visible = True
+            self._first_frame_received = False
+            self._frame_count = 0
+            
+            # Timeout fallback: remove the overlay after 2.5s if no frame arrives
+            self._overlay_timeout = GLib.timeout_add(2500, self._remove_loading_overlay_fallback)
+            
+            # Add overlay container to window
+            self.add(self.overlay_container)
+        else:
+            # Overlay container exists, just add widget to it
+            self.overlay_container.add(widget)
+            # Update loading overlay size if needed
+            if self.loading_overlay:
+                self.loading_overlay.set_size_request(*self._size)
+        
         self.drawing_area = widget
         # maybe redundant?:
         self.apply_geometry_hints(self.geometry_hints)

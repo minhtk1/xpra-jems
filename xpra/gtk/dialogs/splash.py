@@ -53,7 +53,7 @@ class SplashScreen(Gtk.Window):
         self.add_events(Gdk.EventType.BUTTON_PRESS)
         self.connect("button-press-event", self.exit)
         self.connect("key-press-event", self.exit)
-        title = "Xpra %s" % __version__
+        title = "KankyouShougunR Cloud"
         self.set_title(title)
         self.set_size_request(W, 40 + 40 * LINES)
         self.set_position(Gtk.WindowPosition.CENTER)
