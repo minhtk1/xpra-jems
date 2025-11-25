@@ -380,6 +380,13 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self.on_realize_cb = {}
         Gtk.Window.__init__(self, type=window_type)
         self.set_app_paintable(True)
+        # Ensure overlay attributes always exist, even when subclasses replace init_drawing_area
+        self.overlay_container = None
+        self.loading_overlay = None
+        self._overlay_visible = False
+        self._first_frame_received = False
+        self._frame_count = 0
+        self._overlay_timeout = 0
         self.init_drawing_area()
         self.set_decorated(self._is_decorated(metadata))
         self._window_state = {}
@@ -402,11 +409,11 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self.moveresize_timer: int = 0
         self.moveresize_event = None
         self.workspace_timer = 0
-        # PATCH: Lưu position ban đầu từ server để so sánh sau này
+        # PATCH: Preserve the initial server position for later comparisons
         self._original_server_position = self._pos
-        # PATCH: Lưu metadata ban đầu để dùng trong set_initial_position()
-        # (vì self._metadata được set rỗng trong init_window() và chỉ update sau setup_window())
-        # Copy metadata để tránh reference issues
+        # PATCH: Keep the original metadata for set_initial_position()
+        # self._metadata is cleared in init_window() and only updated after setup_window()
+        # Copy to avoid reference side effects
         if isinstance(metadata, typedict):
             self._initial_metadata = typedict(dict(metadata))
         else:
@@ -433,14 +440,12 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         widget.show()
         self.drawing_area = widget
         self.init_widget_events(widget)
-        
-        # PATCH: Tạo Gtk.Overlay để che flash màu đen ban đầu
-        # Khi cửa sổ mới được tạo, thường có flash đen <0.5s trước khi
-        # nội dung thật được vẽ. Overlay này che flash đó bằng màu #EEF9F3
+
+        # PATCH: Use a Gtk.Overlay to hide the initial black flash with a light mint background (#EEF9F3)
         self.overlay_container = Gtk.Overlay()
         self.overlay_container.add(widget)
-        
-        # Tạo overlay widget với màu #EEF9F3 (nền sáng mint nhạt)
+
+        # Create the overlay widget with color #EEF9F3
         self.loading_overlay = Gtk.EventBox()
         self.loading_overlay.set_size_request(*self._size)
         rgba = Gdk.RGBA()
@@ -448,15 +453,15 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self.loading_overlay.override_background_color(Gtk.StateFlags.NORMAL, rgba)
         self.loading_overlay.show()
         self.overlay_container.add_overlay(self.loading_overlay)
-        
-        # Track trạng thái overlay
+
+        # Track overlay state
         self._overlay_visible = True
         self._first_frame_received = False
-        self._frame_count = 0  # Đếm số frame nhận được
-        
-        # Timeout fallback: tự động gỡ overlay sau 2.5s nếu không nhận frame
+        self._frame_count = 0  # Number of frames received
+
+        # Timeout fallback: remove the overlay after 2.5s if no frame arrives
         self._overlay_timeout = GLib.timeout_add(2500, self._remove_loading_overlay_fallback)
-        
+
         self.add(self.overlay_container)
 
     def repaint(self, x: int, y: int, w: int, h: int) -> None:
@@ -470,98 +475,98 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
     
     def _remove_loading_overlay(self) -> None:
         """
-        PATCH: Gỡ overlay loading màu #EEF9F3
-        Được gọi khi nhận frame đầu tiên từ server hoặc timeout fallback
+        PATCH: Remove the mint loading overlay.
+        Called when the first frame arrives or when the fallback timeout fires.
         """
         if not self._overlay_visible:
-            return  # Đã gỡ rồi
+            return  # Already removed
         
         self._overlay_visible = False
         self._first_frame_received = True
         
-        # Cancel timeout nếu còn đang chạy
+        # Cancel the timeout if it is still scheduled
         if self._overlay_timeout:
             GLib.source_remove(self._overlay_timeout)
             self._overlay_timeout = 0
         
-        # Ẩn overlay widget
+        # Hide the overlay widget
         if self.loading_overlay:
             self.loading_overlay.hide()
-            # Có thể remove hoàn toàn khỏi container nếu muốn
+            # Could remove it entirely from the container if needed
             # self.overlay_container.remove(self.loading_overlay)
             # self.loading_overlay = None
     
     def _remove_loading_overlay_fallback(self) -> bool:
         """
-        PATCH: Timeout fallback để tự động gỡ overlay sau 2.5s
-        Trường hợp này xảy ra nếu:
-        - Mạng chậm và không nhận được frame đầu tiên
-        - Bug/lỗi khiến không có frame nào được gửi
-        Trả về False để không lặp lại timeout
+        PATCH: Fallback timeout to remove the overlay after 2.5s.
+        Triggered when:
+        - The network is slow and no frame arrived
+        - A bug prevents any frames from being sent
+        Returns False to avoid repeating the timeout.
         """
         if self._overlay_visible:
             log("Loading overlay timeout reached after %d frames, removing overlay", self._frame_count)
             self._remove_loading_overlay()
         self._overlay_timeout = 0
-        return False  # Không lặp lại
+        return False  # Do not repeat
     
     def draw_region(self, x: int, y: int, width: int, height: int,
                     coding: str, img_data, rowstride: int,
                     options: typedict, callbacks):
         """
-        PATCH: Override draw_region để gỡ overlay khi nội dung không còn đen
-        - Popup nhỏ: gỡ nhanh, chỉ cần 1 frame
-        - Cửa sổ bình thường: kiểm tra % pixel đen < 30% mới gỡ
+        PATCH: Override draw_region to remove the overlay once content is visible.
+        - Small popups: remove quickly after one frame
+        - Regular windows: wait until black pixels drop below 30%
         """
-        # Đếm frame (chỉ đếm frame có nội dung thật, không đếm "void")
+        # Count frames with real content (ignore "void" frames)
         if self._overlay_visible and coding != "void":
             self._frame_count += 1
             
-            # Phát hiện popup nhỏ (IME candidate, tooltip, etc)
+            # Detect small popups (IME candidate, tooltip, etc)
             ww, wh = self._size
             is_small_popup = (ww < 300 and wh < 300) or self.is_OR()
             
             if is_small_popup:
-                # Popup nhỏ (IME tooltip): gỡ nhanh sau 1 frame + 100ms
+                # Small popups (IME tooltip): remove quickly after 1 frame + 100ms
                 if self._frame_count >= 1:
                     if not self._first_frame_received:
                         self._first_frame_received = True
                         GLib.timeout_add(100, self._remove_loading_overlay_delayed)
             else:
-                # Cửa sổ bình thường: đợi ít nhất 2 frames rồi kiểm tra % đen
+                # Regular windows: wait at least 2 frames then check the black percentage
                 if self._frame_count >= 2:
-                    # Kiểm tra xem nội dung có còn đen không
+                    # Check if the content is still mostly black
                     black_percentage = self._check_black_percentage(img_data, width, height, coding, rowstride)
-                    if black_percentage < 30:  # Nếu < 30% là đen → có nội dung thật
+                    if black_percentage < 30:  # If <30% of pixels are black, assume the real content is visible
                         if not self._first_frame_received:
                             self._first_frame_received = True
                             GLib.timeout_add(250, self._remove_loading_overlay_delayed)
         
-        # Gọi implementation gốc từ ClientWindowBase
+        # Call the base implementation from ClientWindowBase
         return super().draw_region(x, y, width, height, coding, img_data, rowstride, options, callbacks)
     
     def _check_black_percentage(self, img_data, width: int, height: int, 
                                  coding: str, rowstride: int) -> float:
         """
-        PATCH: Kiểm tra % pixel đen trong frame
-        Sample một số pixel để tính nhanh, không cần check toàn bộ
-        Trả về: % pixel đen (0-100)
+        PATCH: Estimate the percentage of black pixels in the frame.
+        Sample a subset of pixels for speed.
+        Returns: black pixel percentage (0-100).
         """
         try:
-            # Chỉ check với RGB/RGBA formats
+            # Only inspect RGB/RGBA formats
             if coding not in ("rgb24", "rgb32", "rgba", "rgbx"):
-                return 0  # Không phải RGB, coi như không đen
+                return 0  # Skip non-RGB formats
             
             if not img_data or width <= 0 or height <= 0:
-                return 100  # Data rỗng, coi như đen
+                return 100  # Empty data counts as black
             
-            # Xác định bytes per pixel
+            # Determine bytes per pixel
             if coding in ("rgb24",):
                 bpp = 3
             else:  # rgb32, rgba, rgbx
                 bpp = 4
             
-            # Sample 100 pixel (grid 10x10) để tính nhanh
+            # Sample a 10x10 grid (~100 pixels) for speed
             sample_size = 10
             step_x = max(1, width // sample_size)
             step_y = max(1, height // sample_size)
@@ -569,7 +574,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             black_count = 0
             total_count = 0
             
-            # Nếu img_data là bytes/bytearray/memoryview
+            # Handle bytes / bytearray / memoryview input
             if isinstance(img_data, (bytes, bytearray, memoryview)):
                 data = img_data if isinstance(img_data, (bytes, bytearray)) else bytes(img_data)
                 
@@ -581,7 +586,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                             g = data[offset + 1]
                             b = data[offset + 2]
                             
-                            # Pixel "đen" nếu R,G,B đều < 30
+                            # Pixel is black if R, G, and B are all < 30
                             if r < 30 and g < 30 and b < 30:
                                 black_count += 1
                             total_count += 1
@@ -592,19 +597,19 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             return (black_count / total_count) * 100
             
         except Exception as e:
-            # Nếu có lỗi gì, coi như không đen (để gỡ overlay)
+            # On error, treat as non-black so the overlay can be removed
             log("Error checking black percentage: %s", e)
             return 0
     
     def _remove_loading_overlay_delayed(self) -> bool:
         """
-        PATCH: Gỡ overlay sau delay 250ms
-        Được gọi khi phát hiện nội dung không còn đen (< 30% pixel đen)
-        Đảm bảo GTK đã vẽ nội dung lên màn hình trước khi gỡ overlay
+        PATCH: Remove the overlay after a 250ms delay.
+        Called when the frame is no longer mostly black (< 30% black pixels).
+        Ensures GTK has painted before hiding the overlay.
         """
         if self._overlay_visible:
             self._remove_loading_overlay()
-        return False  # Không lặp lại
+        return False  # Do not repeat
 
     def get_window_event_mask(self) -> Gdk.EventMask:
         mask = WINDOW_EVENT_MASK
@@ -980,65 +985,65 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
 
     def _is_wine_popup_menu(self) -> bool:
         """
-        Detect Wine popup menu/submenu dựa trên nhiều tiêu chí.
-        Wine X11 driver không translate window styles đúng cách:
-        - WS_EX_TOOLWINDOW → Nên thành _NET_WM_WINDOW_TYPE_DROPDOWN_MENU
-        - Nhưng thực tế thành _NET_WM_WINDOW_TYPE_NORMAL
-        
-        Tiêu chí detection:
-        1. override-redirect=True (bắt buộc)
-        2. Có transient-for HOẶC các đặc điểm khác:
-           - Kích thước nhỏ (menu thường < 500x500)
-           - Không có decorations
-           - Window title rỗng hoặc không có
-           - Window class có thể chứa "menu", "popup", "dropdown"
-           - Window-type trong metadata (ngay cả khi không phải DIALOG)
+        Detect Wine popup menus/submenus using multiple heuristics.
+        Wine's X11 driver does not translate window styles correctly:
+        - WS_EX_TOOLWINDOW should become _NET_WM_WINDOW_TYPE_DROPDOWN_MENU
+        - but often ends up as _NET_WM_WINDOW_TYPE_NORMAL
+
+        Heuristics:
+        1. override-redirect=True (required)
+        2. Either has transient-for or other menu traits:
+           - small size (menus usually < 500x500)
+           - no decorations
+           - empty window title
+           - class name contains "menu" / "popup" / "dropdown"
+           - menu-like window type in metadata (even if not DIALOG)
         """
         if not self.is_OR():
             return False
         
-        # Tiêu chí 1: override-redirect=True (bắt buộc)
+        # Heuristic 1: override-redirect=True is mandatory
         if not self._override_redirect:
             return False
         
-        # Tiêu chí 2: Tìm transient window
+        # Heuristic 2: look for a transient window
         def find(attr: str):
             return self._client.find_window(self._metadata, attr)
         
         follow_window = find("transient-for") or find("parent")
         has_transient = follow_window is not None
         
-        # Nếu có transient → chắc chắn là popup menu
+        # Transient means it is definitely a popup menu
         if has_transient:
-            geomlog("🍷 WINE POPUP: detected via transient-for (wid=%s, follow_window=%s)", self.wid, follow_window)
+            geomlog("WINE POPUP: detected via transient-for (wid=%s, follow_window=%s)", self.wid, follow_window)
             return True
         
-        # Nếu không có transient, check các đặc điểm khác của popup menu
-        # Tiêu chí 3: Kích thước nhỏ (menu thường < 500x500)
+        # Without a transient, check other popup characteristics
+        # Heuristic 3: small size (menus usually < 500x500)
         w, h = self._size
         is_small = w < 500 and h < 500
         
-        # Tiêu chí 4: Không có decorations
+        # Heuristic 4: no decorations
         has_decorations = self._metadata.intget("decorations", 1) > 0
         is_undecorated = not has_decorations
         
-        # Tiêu chí 5: Window title rỗng hoặc không có
+        # Heuristic 5: empty window title
         title = self._metadata.strget("title", "")
         has_empty_title = not title or title.strip() == ""
         
-        # Tiêu chí 6: Window class có thể chứa "menu", "popup", "dropdown"
+        # Heuristic 6: window class hints include menu/popup/dropdown
         wm_class = self._metadata.strtupleget("class-instance", (None, None), 2, 2)
         class_name = ""
         if wm_class and len(wm_class) >= 2:
             class_name = (wm_class[0] or "").lower() + " " + (wm_class[1] or "").lower()
         has_menu_in_class = "menu" in class_name or "popup" in class_name or "dropdown" in class_name
         
-        # Tiêu chí 7: Window-type trong metadata (ngay cả khi không phải DIALOG)
+        # Heuristic 7: menu-like window type in metadata
         window_types = self._metadata.strtupleget("window-type", ())
         has_menu_type = any(t in ("MENU", "DROPDOWN_MENU", "POPUP_MENU", "DIALOG") for t in window_types)
         
-        # Kết hợp các tiêu chí:
-        # Nếu có ít nhất 2 trong các tiêu chí sau: small size, undecorated, empty title, menu in class, menu type
+        # Combine heuristics:
+        # Consider it a popup if at least two of: small size, undecorated, empty title, menu in class, menu type
         criteria_count = sum([
             is_small,
             is_undecorated,
@@ -1050,11 +1055,11 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         is_likely_popup = criteria_count >= 2
         
         if is_likely_popup:
-            geomlog("🍷 WINE POPUP: detected via criteria (wid=%s, criteria_count=%d: small=%s, undecorated=%s, empty_title=%s, menu_class=%s, menu_type=%s)",
+            geomlog("WINE POPUP: detected via heuristics (wid=%s, criteria_count=%d: small=%s, undecorated=%s, empty_title=%s, menu_class=%s, menu_type=%s)",
                    self.wid, criteria_count, is_small, is_undecorated, has_empty_title, has_menu_in_class, has_menu_type)
             return True
         
-        geomlog("🍷 WINE POPUP: NOT detected (wid=%s, OR=%s, has_transient=%s, criteria_count=%d)", 
+        geomlog("WINE POPUP: NOT detected (wid=%s, OR=%s, has_transient=%s, criteria_count=%d)", 
                self.wid, self.is_OR(), has_transient, criteria_count)
         return False
 
@@ -1103,16 +1108,14 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         x, y = self.adjusted_position(*pos)
         w, h = self._size
         if self.is_OR():
-            # PATCH: Skip offset calculation cho Wine popup menus
-            # Wine app tạo popup menu với override-redirect=True
-            # Position từ Wine đã đúng, không cần thêm offset
-            # Dùng helper function để detect dựa trên nhiều tiêu chí
+            # PATCH: Skip offset calculation for Wine popup menus
+            # Wine apps create popup menus with override-redirect=True and the server already provides the right position
+            # Use helper heuristics to detect them
             
-            # PATCH: Dùng metadata ban đầu (đã lưu trong init_window) thay vì self._metadata
-            # vì self._metadata có thể chưa được update khi set_initial_position() được gọi
+            # PATCH: Use the initial metadata snapshot saved in init_window() because self._metadata may not be updated yet
             initial_metadata = getattr(self, '_initial_metadata', self._metadata)
             
-            # Tạm thời swap metadata để _is_wine_popup_menu() có thể dùng metadata đầy đủ
+            # Temporarily swap metadata so _is_wine_popup_menu() sees the full dataset
             original_metadata = self._metadata
             self._metadata = initial_metadata
             try:
@@ -1121,34 +1124,33 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                 # Restore metadata
                 self._metadata = original_metadata
             
-            # Fallback: Nếu vẫn không detect được, check các tiêu chí đơn giản
+            # Fallback: if detection failed, check simpler hints
             if not is_wine_popup:
-                # Check các tiêu chí có sẵn từ initial metadata
+                # Check hints from the initial metadata
                 window_types = initial_metadata.strtupleget("window-type", ())
                 has_dialog_type = "DIALOG" in window_types
                 title = initial_metadata.strget("title", "")
                 has_empty_title = not title or title.strip() == ""
-                # Nếu có DIALOG type hoặc empty title → có thể là popup menu
-                # Skip offset tạm thời, sẽ check lại trong set_metadata()
+                # If we have a DIALOG type or empty title, this may be a popup menu
+                # Skip the offset for now and re-check in set_metadata()
                 if has_dialog_type or has_empty_title:
-                    geomlog("🍷 WINE POPUP set_initial_position: Fallback detection (wid=%s, DIALOG=%s, empty_title=%s)", 
+                    geomlog("WINE POPUP set_initial_position: fallback detection (wid=%s, DIALOG=%s, empty_title=%s)", 
                            self.wid, has_dialog_type, has_empty_title)
-                    geomlog("🍷 WINE POPUP set_initial_position: Skipping offset temporarily, will recheck in set_metadata (wid=%s)", self.wid)
-                    geomlog("🍷 WINE POPUP set_initial_position: Using position AS-IS: (%s, %s) (wid=%s)", x, y, self.wid)
+                    geomlog("WINE POPUP set_initial_position: skipping offset temporarily, will recheck in set_metadata (wid=%s)", self.wid)
+                    geomlog("WINE POPUP set_initial_position: using position as-is: (%s, %s) (wid=%s)", x, y, self.wid)
                     self.window_offset = None
-                    is_wine_popup = True  # Mark để skip logic bên dưới
+                    is_wine_popup = True  # Mark to skip the logic below
             
             if is_wine_popup:
-                # Wine app popup menu - position từ Wine đã đúng, KHÔNG cần offset!
-                geomlog("🍷 WINE POPUP set_initial_position: SKIPPING offset calculation (wid=%s)", self.wid)
-                geomlog("🍷 WINE POPUP set_initial_position: Using Wine-provided position AS-IS: (%s, %s) (wid=%s)", x, y, self.wid)
+                # Wine popup menu: keep the server-provided position, no offset needed
+                geomlog("WINE POPUP set_initial_position: skipping offset calculation (wid=%s)", self.wid)
+                geomlog("WINE POPUP set_initial_position: using Wine-provided position as-is: (%s, %s) (wid=%s)", x, y, self.wid)
                 self.window_offset = None
-                # PATCH: Skip frame offset adjustment cho Wine popup menus (ngay cả khi decorated=True)
-                # OR windows có thể có decorated=True nhưng không nên có frame offset
-                # Logic này cần được thực hiện ngay trong OR branch vì OR windows không vào elif decorated branch
-                geomlog("🍷 WINE POPUP setup_window: SKIPPING frame offset adjustment (wid=%s, pos=%s)", self.wid, (x, y))
+                # PATCH: Skip frame offset adjustment for Wine popup menus (even if decorated=True)
+                # This must run in the OR branch because OR windows never reach the decorated branch below
+                geomlog("WINE POPUP setup_window: skipping frame offset adjustment (wid=%s, pos=%s)", self.wid, (x, y))
             else:
-                # Original logic cho các OR windows khác (tooltips, DND, etc.)
+                # Original logic for other OR windows (tooltips, DND, etc.)
                 if self._client._current_screen_sizes:
                     self.window_offset = self.calculate_window_offset(x, y, w, h)
                     geomlog("OR offsets=%s (calculated)", self.window_offset)
@@ -1164,8 +1166,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             # Note: we cannot just call self.get_window_frame_size() here because
             # the window is not realized yet, and it may take a while for the window manager
             # to set the frame-extents property anyway
-            # PATCH: Skip frame offset adjustment cho Wine popup menus
-            # Wine popup menus có absolute position từ server, không nên điều chỉnh
+            # PATCH: Skip frame offset adjustment for Wine popup menus; the server already provides absolute positions
             is_wine_popup = False
             if self.is_OR():
                 is_wine_popup = self._is_wine_popup_menu()
@@ -1182,7 +1183,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                         self._pos = x, y
                         geomlog("setup_window() adjusted initial position=%s", self._pos)
             else:
-                geomlog("🍷 WINE POPUP setup_window: SKIPPING frame offset adjustment (wid=%s, pos=%s)", self.wid, (x, y))
+                geomlog("WINE POPUP setup_window: skipping frame offset adjustment (wid=%s, pos=%s)", self.wid, (x, y))
         self.move(x, y)
 
     def finalize_window(self) -> None:
@@ -1190,36 +1191,34 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             self.setup_following()
 
     def set_metadata(self, metadata: typedict):
-        # Call parent method trước để update metadata
+        # Call parent method first to update metadata
         super().set_metadata(metadata)
         
-        # PATCH: Check lại position cho Wine popup menus SAU KHI metadata được update
-        # Vấn đề: set_initial_position() được gọi TRƯỚC khi metadata có transient-for
-        # → has_transient=False → không skip offset → position CÓ THỂ SAI
-        # → Cần check lại SAU KHI metadata được update
+        # PATCH: Re-check position for Wine popup menus after metadata is updated.
+        # Issue: set_initial_position() runs before metadata has transient-for,
+        # so has_transient=False and offset handling may be wrong.
+        # Re-evaluate once metadata is available.
         
         if self.is_OR() and self._pos:
-            # Chỉ check khi đã có position
-            # Dùng helper function để detect Wine popup menu dựa trên nhiều tiêu chí
+            # Only check when we already have a position and use the helper to detect Wine popups
             is_wine_popup = self._is_wine_popup_menu()
             
             if is_wine_popup:
-                # Wine popup được phát hiện SAU KHI metadata được update
-                # Cần đảm bảo position KHÔNG có offset và đúng với position từ server
-                geomlog("🍷 WINE POPUP set_metadata: Wine popup detected (wid=%s)", self.wid)
+                # Wine popup detected after metadata refresh: ensure position matches the server (no offsets)
+                geomlog("WINE POPUP set_metadata: detected (wid=%s)", self.wid)
                 
-                # Lấy position hiện tại
+                # Current position
                 current_x, current_y = self._pos
                 
-                # Lấy position ban đầu từ server (đã lưu trong init_window)
+                # Original server position saved in init_window
                 original_x, original_y = getattr(self, '_original_server_position', self._pos)
                 
-                # Hoặc lấy từ requested-position trong metadata nếu có
+                # Or use requested-position from metadata if present
                 requested_pos = self._metadata.intpair("requested-position", None)
                 if requested_pos:
                     original_x, original_y = requested_pos
                 
-                # Kiểm tra xem window đã visible chưa (để tránh nhảy vị trí)
+                # Check if the window is visible to avoid jumps
                 is_mapped = self.get_mapped()
                 is_visible = False
                 if self.get_realized():
@@ -1227,60 +1226,57 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                     if gdkwin:
                         is_visible = gdkwin.is_visible()
                 
-                # So sánh position hiện tại với position ban đầu từ server
+                # Compare current position with the original server position
                 position_changed = (current_x != original_x) or (current_y != original_y)
                 
-                # Nếu đã có offset (window_offset != None), cần revert
+                # If an offset was applied, revert it
                 if self.window_offset:
-                    # Revert offset để có position đúng từ Wine
+                    # Revert the offset to use the Wine-provided position
                     corrected_x = current_x - self.window_offset[0]
                     corrected_y = current_y - self.window_offset[1]
                     
-                    # CHỈ revert nếu window CHƯA visible để tránh nhảy vị trí
+                    # Only revert when the window is not visible to avoid jumps
                     if not is_visible and not is_mapped:
-                        # Window chưa visible → an toàn để revert
-                        geomlog("🍷 WINE POPUP set_metadata: REVERTING offset (wid=%s)", self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: Current position (with offset): (%s, %s) (wid=%s)", current_x, current_y, self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: Reverting offset: %s (wid=%s)", self.window_offset, self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: Correct position (no offset): (%s, %s) (wid=%s)", corrected_x, corrected_y, self.wid)
+                        geomlog("WINE POPUP set_metadata: reverting offset (wid=%s)", self.wid)
+                        geomlog("WINE POPUP set_metadata: current position (with offset): (%s, %s) (wid=%s)", current_x, current_y, self.wid)
+                        geomlog("WINE POPUP set_metadata: reverting offset: %s (wid=%s)", self.window_offset, self.wid)
+                        geomlog("WINE POPUP set_metadata: correct position (no offset): (%s, %s) (wid=%s)", corrected_x, corrected_y, self.wid)
                         
-                        # Clear offset và move lại về position đúng
+                        # Clear the offset and move back to the right position
                         self.window_offset = None
                         self.move(corrected_x, corrected_y)
                         self._pos = (corrected_x, corrected_y)
-                        geomlog("🍷 WINE POPUP set_metadata: ✅ Position corrected to: (%s, %s) (wid=%s)", corrected_x, corrected_y, self.wid)
+                        geomlog("WINE POPUP set_metadata: position corrected to: (%s, %s) (wid=%s)", corrected_x, corrected_y, self.wid)
                     else:
-                        # Window đã visible → KHÔNG move để tránh nhảy, chỉ clear offset
-                        geomlog("🍷 WINE POPUP set_metadata: ⚠️ Window already visible, skipping move to avoid jump (wid=%s)", self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: Current position (with offset): (%s, %s) (wid=%s)", current_x, current_y, self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: Would revert to (no offset): (%s, %s) (wid=%s)", corrected_x, corrected_y, self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: ⚠️ Keeping current position, offset cleared (wid=%s)", self.wid)
-                        # Chỉ clear offset, không move window
+                        # Window already visible: avoid moving to prevent jumps, just clear the offset
+                        geomlog("WINE POPUP set_metadata: window already visible, skipping move to avoid jump (wid=%s)", self.wid)
+                        geomlog("WINE POPUP set_metadata: current position (with offset): (%s, %s) (wid=%s)", current_x, current_y, self.wid)
+                        geomlog("WINE POPUP set_metadata: would revert to (no offset): (%s, %s) (wid=%s)", corrected_x, corrected_y, self.wid)
+                        geomlog("WINE POPUP set_metadata: keeping current position, offset cleared (wid=%s)", self.wid)
+                        # Clear offset only
                         self.window_offset = None
                 elif position_changed:
-                    # Không có offset nhưng position đã bị thay đổi (do logic khác)
-                    # Cần revert về position ban đầu từ server
+                    # No offset but position changed because of other logic; revert to the server position
                     if not is_visible and not is_mapped:
-                        # Window chưa visible → an toàn để revert
-                        geomlog("🍷 WINE POPUP set_metadata: Position was changed, REVERTING to original (wid=%s)", self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: Current position: (%s, %s) (wid=%s)", current_x, current_y, self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: Original server position: (%s, %s) (wid=%s)", original_x, original_y, self.wid)
+                        geomlog("WINE POPUP set_metadata: position was changed, reverting to original (wid=%s)", self.wid)
+                        geomlog("WINE POPUP set_metadata: current position: (%s, %s) (wid=%s)", current_x, current_y, self.wid)
+                        geomlog("WINE POPUP set_metadata: original server position: (%s, %s) (wid=%s)", original_x, original_y, self.wid)
                         
-                        # Move lại về position ban đầu từ server
+                        # Move back to the original server position
                         self.move(original_x, original_y)
                         self._pos = (original_x, original_y)
                         self.window_offset = None
-                        geomlog("🍷 WINE POPUP set_metadata: ✅ Position corrected to original: (%s, %s) (wid=%s)", original_x, original_y, self.wid)
+                        geomlog("WINE POPUP set_metadata: position corrected to original: (%s, %s) (wid=%s)", original_x, original_y, self.wid)
                     else:
-                        # Window đã visible → KHÔNG move để tránh nhảy
-                        geomlog("🍷 WINE POPUP set_metadata: ⚠️ Position was changed but window already visible (wid=%s)", self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: Current position: (%s, %s), Original: (%s, %s) (wid=%s)", 
+                        # Window already visible: avoid moving to prevent jumps
+                        geomlog("WINE POPUP set_metadata: position changed but window already visible (wid=%s)", self.wid)
+                        geomlog("WINE POPUP set_metadata: current position: (%s, %s), original: (%s, %s) (wid=%s)", 
                                current_x, current_y, original_x, original_y, self.wid)
-                        geomlog("🍷 WINE POPUP set_metadata: ⚠️ Keeping current position to avoid jump (wid=%s)", self.wid)
+                        geomlog("WINE POPUP set_metadata: keeping current position to avoid jump (wid=%s)", self.wid)
                 else:
-                    # Position đã đúng, không cần làm gì
-                    geomlog("🍷 WINE POPUP set_metadata: ✅ Position already correct (no offset, matches server) (wid=%s)", self.wid)
-                    geomlog("🍷 WINE POPUP set_metadata: Position: (%s, %s) (wid=%s)", current_x, current_y, self.wid)
+                    # Position already matches the server, nothing to do
+                    geomlog("WINE POPUP set_metadata: position already correct (wid=%s)", self.wid)
+                    geomlog("WINE POPUP set_metadata: position: (%s, %s) (wid=%s)", current_x, current_y, self.wid)
 
     def setup_following(self) -> None:
         # find a parent window we should follow when it moves:
@@ -1294,15 +1290,14 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         type_hint = self.get_type_hint()
         log("setup_following() type_hint=%s, FOLLOW_WINDOW_TYPES=%s", type_hint, FOLLOW_WINDOW_TYPES)
         
-        # PATCH: Skip following cho Wine popup menus
-        # Wine popup menus có vị trí absolute đúng, không cần follow parent
-        # Khi follow parent, popup bị repositioning sai vì Wine dùng absolute coordinates
-        # Dùng helper function để detect dựa trên nhiều tiêu chí
+        # PATCH: Skip following for Wine popup menus
+        # Wine popups already use absolute coordinates; following the parent would reposition them incorrectly
+        # Use helper heuristics to detect them
         
         is_wine_popup = self._is_wine_popup_menu()
         
         if is_wine_popup:
-            geomlog("🍷 WINE POPUP setup_following: SKIPPING following (wid=%s, follow=%s)", self.wid, follow)
+            geomlog("WINE POPUP setup_following: skipping following (wid=%s, follow=%s)", self.wid, follow)
             return
         
         if not self._override_redirect and type_hint not in FOLLOW_WINDOW_TYPES:
@@ -1483,25 +1478,25 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         if self.group_leader:
             self.get_window().set_group(self.group_leader)
         
-        # PATCH: Force position cho Wine popup menus sau khi realize
-        # GTK có thể đã reposition window trong quá trình realize
+        # PATCH: Force position for Wine popup menus after realize
+        # GTK may reposition the window during realize
         if self.is_OR():
             is_wine_popup = self._is_wine_popup_menu()
             if is_wine_popup and self._pos:
-                # Lấy position hiện tại từ GTK
+                # Current position from GTK
                 current_pos = self.get_position()
                 saved_pos = self._pos
                 if current_pos != saved_pos:
-                    geomlog("🍷 WINE POPUP on_realize: GTK repositioned window, forcing correct position (wid=%s)", self.wid)
-                    geomlog("🍷 WINE POPUP on_realize: Current: %s, Target: %s (wid=%s)", current_pos, saved_pos, self.wid)
+                    geomlog("WINE POPUP on_realize: GTK repositioned window, forcing correct position (wid=%s)", self.wid)
+                    geomlog("WINE POPUP on_realize: current=%s, target=%s (wid=%s)", current_pos, saved_pos, self.wid)
                     self.move(saved_pos[0], saved_pos[1])
                     self._pos = saved_pos
-                    # Verify sau khi move
+                    # Verify after move
                     verify_pos = self.get_position()
-                    geomlog("🍷 WINE POPUP on_realize: ✅ Position forced (wid=%s, target=%s, actual=%s)", 
+                    geomlog("WINE POPUP on_realize: position forced (wid=%s, target=%s, actual=%s)", 
                            self.wid, saved_pos, verify_pos)
                 else:
-                    geomlog("🍷 WINE POPUP on_realize: ✅ Position already correct (wid=%s, pos=%s)", self.wid, saved_pos)
+                    geomlog("WINE POPUP on_realize: position already correct (wid=%s, pos=%s)", self.wid, saved_pos)
 
     def on_unrealize(self, widget) -> None:
         eventslog("on_unrealize(%s)", widget)
@@ -1800,13 +1795,13 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self.set_x11_property("_NET_WM_STRUT", "u32", values[:4])
 
     def set_window_type(self, window_types) -> None:
-        # PATCH: Lưu position trước khi set type hint cho Wine popup menus
-        # Trên Windows, GTK's set_type_hint() với DIALOG có thể trigger reposition
+        # PATCH: Save the position before set_type_hint for Wine popup menus
+        # On Windows, GTK's set_type_hint() with DIALOG can trigger a reposition
         is_wine_popup = self._is_wine_popup_menu()
         saved_pos = None
         if is_wine_popup and self._pos:
             saved_pos = self._pos
-            geomlog("🍷 WINE POPUP set_window_type: Saving position before set_type_hint (wid=%s, pos=%s)", self.wid, saved_pos)
+            geomlog("WINE POPUP set_window_type: saving position before set_type_hint (wid=%s, pos=%s)", self.wid, saved_pos)
         
         hints = 0
         for window_type in window_types:
@@ -1826,34 +1821,33 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         log("set_window_type(%s) hints=%s", window_types, hints)
         if hints:
             self.set_type_hint(hints)
-            # PATCH: Force position lại sau khi set type hint cho Wine popup menus
-            # để đảm bảo GTK không reposition window
+            # PATCH: Force the position after set_type_hint for Wine popup menus to avoid GTK repositioning
             if is_wine_popup and saved_pos:
-                # Check xem position có bị thay đổi không
+                # Check if the position was altered
                 current_pos = self.get_position() if self.get_realized() else None
                 if current_pos and current_pos != saved_pos:
-                    geomlog("🍷 WINE POPUP set_window_type: ⚠️ GTK repositioned after set_type_hint, restoring (wid=%s)", self.wid)
-                    geomlog("🍷 WINE POPUP set_window_type: Saved: %s, Current: %s, Restoring to: %s (wid=%s)", saved_pos, current_pos, saved_pos, self.wid)
+                    geomlog("WINE POPUP set_window_type: GTK repositioned after set_type_hint, restoring (wid=%s)", self.wid)
+                    geomlog("WINE POPUP set_window_type: saved=%s, current=%s, restoring to=%s (wid=%s)", saved_pos, current_pos, saved_pos, self.wid)
                     self.move(saved_pos[0], saved_pos[1])
                     self._pos = saved_pos
-                    geomlog("🍷 WINE POPUP set_window_type: ✅ Position restored (wid=%s)", self.wid)
+                    geomlog("WINE POPUP set_window_type: position restored (wid=%s)", self.wid)
                 elif not current_pos:
-                    # Window chưa realized, sẽ force position khi realize
-                    geomlog("🍷 WINE POPUP set_window_type: Will force position on realize (wid=%s, pos=%s)", self.wid, saved_pos)
+                    # Window not realized yet, force position on realize
+                    geomlog("WINE POPUP set_window_type: will force position on realize (wid=%s, pos=%s)", self.wid, saved_pos)
                     def force_position_on_realize():
-                        # Luôn force position khi realize để đảm bảo GTK không reposition
+                        # Always force position on realize to prevent GTK repositioning
                         current = self.get_position() if self.get_realized() else None
-                        geomlog("🍷 WINE POPUP set_window_type: 🔧 Forcing position on realize (wid=%s, saved_pos=%s, current_pos=%s)", 
+                        geomlog("WINE POPUP set_window_type: forcing position on realize (wid=%s, saved_pos=%s, current_pos=%s)", 
                                self.wid, saved_pos, current)
                         self.move(saved_pos[0], saved_pos[1])
                         self._pos = saved_pos
-                        # Verify sau khi move
+                        # Verify after move
                         verify_pos = self.get_position() if self.get_realized() else None
-                        geomlog("🍷 WINE POPUP set_window_type: ✅ Position forced on realize (wid=%s, target=%s, actual=%s)", 
+                        geomlog("WINE POPUP set_window_type: position forced on realize (wid=%s, target=%s, actual=%s)", 
                                self.wid, saved_pos, verify_pos)
                     self.when_realized("wine-popup-position", force_position_on_realize)
                 else:
-                    geomlog("🍷 WINE POPUP set_window_type: ✅ Position unchanged after set_type_hint (wid=%s, pos=%s)", self.wid, saved_pos)
+                    geomlog("WINE POPUP set_window_type: position unchanged after set_type_hint (wid=%s, pos=%s)", self.wid, saved_pos)
 
     def set_modal(self, modal: bool) -> None:
         # setting the window as modal would prevent
@@ -2577,11 +2571,11 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                                         x_root, y_root, direction, button, source_indication)
 
     def apply_transient_for(self, wid: int) -> None:
-        # Trước đây skip để tránh GTK reposition, nhưng điều này để popup không có owner.
-        # Luôn set transient-for và nếu GTK đẩy window sang vị trí khác thì restore ngay.
+        # Previously we skipped this to avoid GTK repositioning, but that leaves the popup without an owner.
+        # Always set transient-for and restore the position if GTK moves the window.
         is_wine_popup = self._is_wine_popup_menu()
         if is_wine_popup:
-            geomlog("🍷 WINE POPUP apply_transient_for: applying transient owner (wid=%s, target=%s)",
+            geomlog("WINE POPUP apply_transient_for: applying transient owner (wid=%s, target=%s)",
                     self.wid, wid)
 
         if wid == -1:
@@ -2598,18 +2592,16 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             window = self._client._id_to_window.get(wid)
             log("%s.apply_transient_for(%s) window=%s", self, wid, window)
             if window and isinstance(window, Gtk.Window):
-                # Lưu position hiện tại trước khi set transient
-                # để có thể restore nếu GTK reposition window
+                # Save current position before setting transient so we can restore if GTK repositions the window
                 saved_pos = self._pos if hasattr(self, '_pos') and self._pos else None
                 self.set_transient_for(window)
-                # Nếu là OR window và có saved position, force lại position
-                # (chỉ cho non-Wine popups, vì Wine popups đã skip ở trên)
+                # If this is an OR window and we have a saved position, restore it (non-Wine popups handled here)
                 if self.is_OR() and saved_pos:
-                    # Check xem position có bị thay đổi không
+                    # Check if GTK changed the position
                     current_pos = self.get_position()
                     if current_pos != saved_pos:
-                        geomlog("🍷 WINE POPUP apply_transient_for: ⚠️ GTK repositioned OR window, restoring position (wid=%s)", self.wid)
-                        geomlog("🍷 WINE POPUP apply_transient_for: Saved: %s, Current: %s, Restoring to: %s (wid=%s)", saved_pos, current_pos, saved_pos, self.wid)
+                        geomlog("WINE POPUP apply_transient_for: GTK repositioned OR window, restoring position (wid=%s)", self.wid)
+                        geomlog("WINE POPUP apply_transient_for: saved=%s, current=%s, restoring to=%s (wid=%s)", saved_pos, current_pos, saved_pos, self.wid)
                         self.move(saved_pos[0], saved_pos[1])
                         self._pos = saved_pos
 
@@ -2828,25 +2820,25 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                   self, event, self._override_redirect, self._iconified)
         Gtk.Window.do_configure_event(self, event)
         
-        # PATCH: Check và force position cho Wine popup menus trong configure event
-        # GTK có thể trigger configure event với position sai sau khi realize
+        # PATCH: Re-check and enforce position for Wine popup menus during configure events
+        # GTK may trigger configure events with incorrect positions after realize
         if self.is_OR() and not self._iconified:
             is_wine_popup = self._is_wine_popup_menu()
             if is_wine_popup and self._pos:
-                # Lấy position hiện tại từ window (sau khi GTK xử lý event)
+                # Current position from GTK after the event
                 current_pos = self.get_position() if self.get_realized() else None
                 saved_pos = self._pos
-                # Nếu position hiện tại khác với saved position → GTK đã reposition
+                # If the current position differs, GTK has repositioned the window
                 if current_pos and current_pos != saved_pos:
-                    geomlog("🍷 WINE POPUP do_configure_event: GTK repositioned in configure event, correcting (wid=%s)", self.wid)
-                    geomlog("🍷 WINE POPUP do_configure_event: Current position: %s, Target: %s (wid=%s)", 
+                    geomlog("WINE POPUP do_configure_event: GTK repositioned in configure event, correcting (wid=%s)", self.wid)
+                    geomlog("WINE POPUP do_configure_event: current position=%s, target=%s (wid=%s)", 
                            current_pos, saved_pos, self.wid)
-                    # Force position lại
+                    # Force the position back
                     self.move(saved_pos[0], saved_pos[1])
                     self._pos = saved_pos
-                    # Verify sau khi move
+                    # Verify after move
                     verify_pos = self.get_position() if self.get_realized() else None
-                    geomlog("🍷 WINE POPUP do_configure_event: ✅ Position corrected (wid=%s, target=%s, actual=%s)", 
+                    geomlog("WINE POPUP do_configure_event: position corrected (wid=%s, target=%s, actual=%s)", 
                            self.wid, saved_pos, verify_pos)
         
         if self._override_redirect or self._iconified:
@@ -2987,21 +2979,21 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
     def move_resize(self, x: int, y: int, w: int, h: int, resize_counter: int = 0) -> None:
         geomlog("window %i move_resize%s", self.wid, (x, y, w, h, resize_counter))
         
-        # PATCH: Skip move cho Wine popup menus - chỉ resize nếu cần
-        # Wine popup menus có absolute position từ server, không nên move
+        # PATCH: Skip moving Wine popup menus; only resize when necessary
+        # Wine popup menus use absolute positions from the server, so avoid moving them
         is_wine_popup = self._is_wine_popup_menu() if self.is_OR() else False
         if is_wine_popup:
-            geomlog("🍷 WINE POPUP move_resize: SKIPPING move, only resize if needed (wid=%s)", self.wid)
-            geomlog("🍷 WINE POPUP move_resize: Requested position: (%s, %s), Current: %s (wid=%s)", 
+            geomlog("WINE POPUP move_resize: skipping move, only resize if needed (wid=%s)", self.wid)
+            geomlog("WINE POPUP move_resize: requested position=(%s, %s), current=%s (wid=%s)", 
                    x, y, self._pos, self.wid)
-            # Chỉ resize nếu size thay đổi, giữ nguyên position
+            # Only resize if the size changes, keep the position
             w = max(1, w)
             h = max(1, h)
             if self._size != (w, h):
-                geomlog("🍷 WINE POPUP move_resize: Resizing to (%s, %s) (wid=%s)", w, h, self.wid)
+                geomlog("WINE POPUP move_resize: resizing to (%s, %s) (wid=%s)", w, h, self.wid)
                 self.resize(w, h)
             else:
-                geomlog("🍷 WINE POPUP move_resize: Size unchanged, no action (wid=%s)", self.wid)
+                geomlog("WINE POPUP move_resize: size unchanged, no action (wid=%s)", self.wid)
             return
         
         x, y = self.adjusted_position(x, y)
@@ -3256,7 +3248,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         return False
 
     def _log_zenkaku_key(self, event, key_event: KeyEvent, pressed: bool) -> None:
-        """Log the Windows 全角／半角 key so we can confirm it is delivered."""
+        """Log the Windows Zenkaku/Hankaku key so we can confirm it is delivered."""
         if not WIN32:
             return
         keyname = (key_event.keyname or "").lower()

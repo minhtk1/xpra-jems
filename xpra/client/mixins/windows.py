@@ -950,7 +950,7 @@ class WindowClient(StubClientMixin):
             metadata["override-redirect"] = True
             if not metadata.strget("role"):
                 metadata["role"] = "popup"
-            geomlog("🍷 WINE POPUP _process_new_common: forcing override-redirect (wid=%s, features=%s, reason=%s)",
+            geomlog("WINE POPUP _process_new_common: forcing override-redirect (wid=%s, features=%s, reason=%s)",
                     wid, popup_info["features_for_log"],
                     "ownerless" if popup_info["ownerless"] else "skip-taskbar/pager/above")
         elif override_redirect:
@@ -961,7 +961,7 @@ class WindowClient(StubClientMixin):
             and is_decorated
             and not popup_info["ownerless"]
         ):
-            geomlog("🍷 WINE POPUP _process_new_common: NOT forcing OR for decorated window (wid=%s, features=%s)",
+            geomlog("WINE POPUP _process_new_common: NOT forcing OR for decorated window (wid=%s, features=%s)",
                     wid, popup_info["features_for_log"])
         if heuristics_popup:
             metadata["_client-popup-heuristics"] = True
@@ -969,20 +969,20 @@ class WindowClient(StubClientMixin):
         has_owner_hint = popup_info["owner_wid"] > 0 or follow_window is not None
         is_likely_wine_popup = override_redirect and (has_owner_hint or heuristics_popup)
         if is_likely_wine_popup:
-            geomlog("🍷 WINE POPUP _process_new_common: Likely Wine popup detected (wid=%s, owner_hint=%s, features=%s)",
+            geomlog("WINE POPUP _process_new_common: likely Wine popup detected (wid=%s, owner_hint=%s, features=%s)",
                     wid, has_owner_hint, popup_info["features_for_log"])
-            geomlog("🍷 WINE POPUP _process_new_common: SKIPPING relative-position logic (wid=%s)", wid)
+            geomlog("WINE POPUP _process_new_common: skipping relative-position logic (wid=%s)", wid)
         if override_redirect and metadata.intget("transient-for", 0) <= 0 and heuristics_popup:
             assigned_owner = self._assign_transient_for_from_pid(metadata)
             if assigned_owner:
-                geomlog("🍷 WINE POPUP _process_new_common: inferred transient-for=%s using pid (wid=%s)",
+                geomlog("WINE POPUP _process_new_common: inferred transient-for=%s using pid (wid=%s)",
                         assigned_owner, wid)
 
         rel_pos = metadata.inttupleget("relative-position")
         parent = metadata.intget("parent")
         geomlog("relative-position=%s (parent=%s)", rel_pos, parent)
-        # PATCH: Skip relative-position cho Wine popup menus
-        # Wine popup có absolute position từ server, không nên apply relative-position
+        # PATCH: Skip relative-position for Wine popup menus
+        # Wine popups already use absolute positions from the server
         if parent and rel_pos and not is_likely_wine_popup:
             pwin = self._id_to_window.get(parent)
             if pwin:
@@ -1004,24 +1004,23 @@ class WindowClient(StubClientMixin):
         geomlog("process_new_common: wid=%i, OR=%s, geometry(%s)=%s / %s",
                 wid, override_redirect, packet[2:6], (wx, wy, ww, wh), (bw, bh))
         
-        # PATCH: Preserve position cho Wine popup menus khi window bị tạo lại
-        # Server có thể xóa và tạo lại window khi nhận diện sai window type
-        # Nếu là OR window và có thể là Wine popup, preserve position từ server
+        # PATCH: Preserve position for Wine popup menus when windows are recreated
+        # The server may delete and recreate a window when it mis-detects the window type
+        # If this is an OR window and likely a Wine popup, keep the server-provided position
         preserved_position = None
         if is_likely_wine_popup:
-            # Preserve position từ server (không apply relative position nếu đã có)
-            # Position từ server đã đúng cho Wine popup
-            # Lưu ý: wx, wy đã được scale, nhưng position từ server đã đúng
+            # Preserve the server position (do not apply relative positioning)
+            # wx and wy are already scaled; the server coordinates are correct for Wine popups
             preserved_position = (wx, wy)
-            geomlog("🍷 WINE POPUP _process_new_common: Preserving position from server: (%s, %s) (wid=%s)", wx, wy, wid)
+            geomlog("WINE POPUP _process_new_common: preserving position from server: (%s, %s) (wid=%s)", wx, wy, wid)
         
         window = self.make_new_window(wid, wx, wy, ww, wh, bw, bh, metadata, override_redirect, client_properties)
         
-        # PATCH: Set preserved position cho Wine popup nếu có
+        # PATCH: Apply the preserved position for Wine popup if present
         if preserved_position and window and hasattr(window, '_pos'):
-            # Đảm bảo position được preserve ngay từ đầu
+            # Ensure the position is preserved immediately
             window._pos = preserved_position
-            geomlog("🍷 WINE POPUP _process_new_common: ✅ Position preserved: (%s, %s) (wid=%s)", preserved_position[0], preserved_position[1], wid)
+            geomlog("WINE POPUP _process_new_common: position preserved: (%s, %s) (wid=%s)", preserved_position[0], preserved_position[1], wid)
         
         return window
 
@@ -1393,21 +1392,21 @@ class WindowClient(StubClientMixin):
         geomlog("_process_window_move_resize%s moving / resizing window %s (id=%s) to %s",
                 packet[1:], window, wid, (ax, ay, aw, ah))
         if window:
-            # PATCH: Skip move cho Wine popup menus - chỉ resize nếu cần
-            # Wine popup menus có absolute position từ server, không nên move
+            # PATCH: Skip moving Wine popup menus; only resize if needed
+            # Wine popups use absolute positions from the server
             if hasattr(window, '_is_wine_popup_menu'):
                 is_wine_popup = window._is_wine_popup_menu()
                 if is_wine_popup:
-                    geomlog("🍷 WINE POPUP _process_window_move_resize: SKIPPING move, only resize if needed (wid=%s)", wid)
-                    geomlog("🍷 WINE POPUP _process_window_move_resize: Requested position: (%s, %s), Current: %s (wid=%s)", 
+                    geomlog("WINE POPUP _process_window_move_resize: skipping move, only resize if needed (wid=%s)", wid)
+                    geomlog("WINE POPUP _process_window_move_resize: requested position=(%s, %s), current=%s (wid=%s)", 
                            ax, ay, window._pos, wid)
-                    # Chỉ resize nếu size thay đổi, giữ nguyên position
+                    # Only resize if the size changes, keep the position
                     current_w, current_h = window._size
                     if (aw, ah) != (current_w, current_h):
-                        geomlog("🍷 WINE POPUP _process_window_move_resize: Resizing to (%s, %s) (wid=%s)", aw, ah, wid)
+                        geomlog("WINE POPUP _process_window_move_resize: resizing to (%s, %s) (wid=%s)", aw, ah, wid)
                         window.resize(aw, ah)
                     else:
-                        geomlog("🍷 WINE POPUP _process_window_move_resize: Size unchanged, no action (wid=%s)", wid)
+                        geomlog("WINE POPUP _process_window_move_resize: size unchanged, no action (wid=%s)", wid)
                     return
             window.move_resize(ax, ay, aw, ah, resize_counter)
 
@@ -1443,21 +1442,21 @@ class WindowClient(StubClientMixin):
         geomlog("_process_configure_override_redirect%s move resize window %s (id=%s) to %s",
                 packet[1:], window, wid, (ax, ay, aw, ah))
         if window:
-            # PATCH: Skip move cho Wine popup menus - chỉ resize nếu cần
-            # Wine popup menus có absolute position từ server, không nên move
+            # PATCH: Skip moving Wine popup menus; only resize when necessary
+            # Wine popup menus use absolute positions from the server
             if hasattr(window, '_is_wine_popup_menu'):
                 is_wine_popup = window._is_wine_popup_menu()
                 if is_wine_popup:
-                    geomlog("🍷 WINE POPUP _process_configure_override_redirect: SKIPPING move, only resize if needed (wid=%s)", wid)
-                    geomlog("🍷 WINE POPUP _process_configure_override_redirect: Requested position: (%s, %s), Current: %s (wid=%s)", 
+                    geomlog("WINE POPUP _process_configure_override_redirect: skipping move, only resize if needed (wid=%s)", wid)
+                    geomlog("WINE POPUP _process_configure_override_redirect: requested position=(%s, %s), current=%s (wid=%s)", 
                            ax, ay, window._pos, wid)
-                    # Chỉ resize nếu size thay đổi, giữ nguyên position
+                    # Only resize if the size changes, keep the position
                     current_w, current_h = window._size
                     if (aw, ah) != (current_w, current_h):
-                        geomlog("🍷 WINE POPUP _process_configure_override_redirect: Resizing to (%s, %s) (wid=%s)", aw, ah, wid)
+                        geomlog("WINE POPUP _process_configure_override_redirect: resizing to (%s, %s) (wid=%s)", aw, ah, wid)
                         window.resize(aw, ah)
                     else:
-                        geomlog("🍷 WINE POPUP _process_configure_override_redirect: Size unchanged, no action (wid=%s)", wid)
+                        geomlog("WINE POPUP _process_configure_override_redirect: size unchanged, no action (wid=%s)", wid)
                     return
             window.move_resize(ax, ay, aw, ah, -1)
 
