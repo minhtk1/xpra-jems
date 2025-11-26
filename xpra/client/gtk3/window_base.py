@@ -20,7 +20,7 @@ from xpra.os_util import gi_import, WIN32, OSX, POSIX
 from xpra.util.system import is_Wayland, is_X11
 from xpra.util.objects import typedict
 from xpra.util.str_fn import csv, bytestostr
-from xpra.util.env import envint, envbool, first_time, ignorewarnings, IgnoreWarningsContext
+from xpra.util.env import envint, envbool, envfloat, first_time, ignorewarnings, IgnoreWarningsContext
 from xpra.gtk.gobject import no_arg_signal, one_arg_signal
 from xpra.gtk.util import ds_inited, get_default_root_window, GRAB_STATUS_STRING
 from xpra.gtk.window import set_visual
@@ -70,7 +70,16 @@ NotifyInferior = None
 X11Window = X11Core = None
 
 WIN32_WORKSPACE = WIN32 and envbool("XPRA_WIN32_WORKSPACE", False)
-WIN32_POPUP_TRIM_CACHE: dict[str, int] = {}
+WIN32_POPUP_EXTRA_TRIM_DEFAULT = 5.3
+WIN32_POPUP_ROUNDING_BIAS_DEFAULT = 1.255
+WIN32_POPUP_TRIM_CACHE: dict[str, tuple[int, float, float]] = {}
+WIN32_IME_CLASS_HINTS: tuple[str, ...] = (
+    "msctfime", "ime ui", "imeui", "msime", "textinputhostwindow",
+    "tsfui", "candidate", "imepad", "pintip", "imm32",
+)
+WIN32_IME_TITLE_HINTS: tuple[str, ...] = (
+    "ime", "candidate", "conversion", "変換", "入力候補",
+)
 
 
 def use_x11_bindings() -> bool:
@@ -1319,6 +1328,30 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                self.wid, self.is_OR(), has_transient, criteria_count)
         return False
 
+    def _is_win32_ime_popup(self) -> bool:
+        if not WIN32 or not self.is_OR():
+            return False
+        metadata = getattr(self, "_initial_metadata", None) or self._metadata
+        if not metadata:
+            return False
+        wm_class = metadata.strtupleget("class-instance", (None, None), 2, 2)
+        class_tokens = tuple((value or "").lower() for value in wm_class if value)
+        for value in class_tokens:
+            for hint in WIN32_IME_CLASS_HINTS:
+                if hint in value:
+                    geomlog("Win32 IME popup detected via class %r (wid=%s)", value, self.wid)
+                    return True
+        title = (metadata.strget("title", "") or "").lower()
+        for hint in WIN32_IME_TITLE_HINTS:
+            if hint and hint in title:
+                geomlog("Win32 IME popup detected via title %r (wid=%s)", title, self.wid)
+                return True
+        role = (metadata.strget("window-role", "") or "").lower()
+        if role and "ime" in role:
+            geomlog("Win32 IME popup detected via role %r (wid=%s)", role, self.wid)
+            return True
+        return False
+
     def set_decorated(self, decorated: bool) -> None:
         was_decorated = self.get_decorated()
         if self._fullscreen and was_decorated and not decorated:
@@ -2169,24 +2202,54 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             return None
         return "|".join(key_parts)
 
+    def _current_extra_trim(self) -> float:
+        value = envfloat("XPRA_WIN32_POPUP_EXTRA_TRIM", WIN32_POPUP_EXTRA_TRIM_DEFAULT)
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return WIN32_POPUP_EXTRA_TRIM_DEFAULT
+
+    def _current_rounding_bias(self) -> float:
+        value = envfloat("XPRA_WIN32_POPUP_ROUNDING_BIAS", WIN32_POPUP_ROUNDING_BIAS_DEFAULT)
+        try:
+            bias = float(value)
+        except (TypeError, ValueError):
+            return WIN32_POPUP_ROUNDING_BIAS_DEFAULT
+        return max(0.0, min(1.0, bias))
+
+    def _round_trim_value(self, trim_value: float) -> int:
+        if trim_value <= 0:
+            return 0
+        return max(1, int(math.floor(trim_value + self._current_rounding_bias())))
+
     def _get_cached_win32_trim(self) -> int:
         key = self._get_win32_trim_cache_key()
         if key:
-            return WIN32_POPUP_TRIM_CACHE.get(key, 0)
+            cached = WIN32_POPUP_TRIM_CACHE.get(key)
+            if cached:
+                trim_value, trim_extra, trim_bias = cached
+                if abs(trim_bias - self._current_rounding_bias()) > 0.0001:
+                    return 0
+                delta = self._current_extra_trim() - trim_extra
+                adjusted = trim_value + delta
+                if adjusted <= 0.5:
+                    return 0
+                return self._round_trim_value(adjusted)
         return 0
 
     def _store_win32_trim(self, trim: int) -> None:
         key = self._get_win32_trim_cache_key()
         if not key:
             return
-        prev = WIN32_POPUP_TRIM_CACHE.get(key, 0)
-        if trim > prev:
-            WIN32_POPUP_TRIM_CACHE[key] = trim
+        WIN32_POPUP_TRIM_CACHE[key] = (trim, self._current_extra_trim(), self._current_rounding_bias())
 
     def _maybe_trim_win32_shadow(self) -> bool:
         """Detect solid shadow rows in the backing and clip them via SetWindowRgn."""
         metadata = getattr(self, "_initial_metadata", None) or self._metadata
         if not self._override_redirect or not metadata.boolget("_client-popup-heuristics", False):
+            return False
+        if self._is_win32_ime_popup():
+            geomlog("Skipping Win32 shadow trim for IME popup wid=%s", self.wid)
             return False
         window = self.get_window()
         if not window:
@@ -2238,6 +2301,13 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             geomlog("Win32 popup residual dark rows=%s, extending trim by %s (wid=%s)",
                     residual_rows, extra, self.wid)
             trim = min(height, trim + extra)
+        extra_trim = self._current_extra_trim()
+        if extra_trim > 0:
+            trim_before = trim
+            trim = min(height, trim + extra_trim)
+            added = trim - trim_before
+            if added > 0:
+                geomlog("Win32 popup forcing additional trim of %.3fpx (wid=%s)", added, self.wid)
         boundary_ratio = max(0.0, min(1.0, boundary_ratio))
         if not fallback_used:
             extra_rows = 0
@@ -2250,19 +2320,20 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                 geomlog("Win32 popup shadow boundary still dark (ratio=%.3f), extending trim by %spx (wid=%s)",
                         boundary_ratio, extra_rows, self.wid)
         if fallback_used:
-            margin = max(2, min(6, trim // 6))
+            margin = float(max(2, min(6, trim // 6)))
         else:
             if boundary_ratio >= 0.8:
-                margin = 0
+                margin = 0.0
             elif boundary_ratio >= 0.5:
-                margin = 1
+                margin = 1.0
             else:
-                margin = 2
-        detected_trim = max(1, trim - margin)
+                margin = 2.0
+        raw_trim = max(1.0, trim - margin)
+        detected_trim = self._round_trim_value(raw_trim)
         if cached_trim > 0 and detected_trim + 1 < cached_trim:
             detected_trim = min(cached_trim, height - 1)
-            geomlog("Win32 popup shadow detection %spx < cached %spx, using cached value (wid=%s)",
-                    max(1, trim - margin), cached_trim, self.wid)
+            geomlog("Win32 popup shadow detection %.3fpx < cached %spx, using cached value (wid=%s)",
+                    raw_trim, cached_trim, self.wid)
         self._win32_shadow_trim = detected_trim
         w, h = self._size
         trimmed_height = max(1, h - self._win32_shadow_trim)
