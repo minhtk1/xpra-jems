@@ -76,9 +76,11 @@ WIN32_POPUP_TRIM_CACHE: dict[str, tuple[int, float, float]] = {}
 WIN32_IME_CLASS_HINTS: tuple[str, ...] = (
     "msctfime", "ime ui", "imeui", "msime", "textinputhostwindow",
     "tsfui", "candidate", "imepad", "pintip", "imm32",
+    "fcitx", "ibus", "mozc", "pinyin", "hangul", "atok", "google-ime",
 )
 WIN32_IME_TITLE_HINTS: tuple[str, ...] = (
     "ime", "candidate", "conversion", "変換", "入力候補",
+    "input window", "text input", "composition", "候補", "fcitx", "ibus", "mozc",
 )
 
 
@@ -1342,14 +1344,28 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                     geomlog("Win32 IME popup detected via class %r (wid=%s)", value, self.wid)
                     return True
         title = (metadata.strget("title", "") or "").lower()
-        for hint in WIN32_IME_TITLE_HINTS:
-            if hint and hint in title:
-                geomlog("Win32 IME popup detected via title %r (wid=%s)", title, self.wid)
-                return True
+        if title:
+            for hint in WIN32_IME_TITLE_HINTS:
+                if hint and hint in title:
+                    geomlog("Win32 IME popup detected via title %r (wid=%s)", title, self.wid)
+                    return True
         role = (metadata.strget("window-role", "") or "").lower()
         if role and "ime" in role:
             geomlog("Win32 IME popup detected via role %r (wid=%s)", role, self.wid)
             return True
+        command = (metadata.strget("command", "") or "").lower()
+        if command:
+            for hint in ("fcitx", "mozc", "ibus", "textinputhost", "ime", "pinyin"):
+                if hint in command:
+                    geomlog("Win32 IME popup detected via command %r (hint=%s, wid=%s)", command, hint, self.wid)
+                    return True
+        width, height = self._size
+        if width <= 400 and height <= 160 and (("POPUP_MENU" in metadata.strtupleget("window-type", ())) or
+                                               metadata.boolget("has-alpha", False)):
+            title_tokens = (title or "") + " " + " ".join(class_tokens)
+            if "input" in title_tokens or "candidate" in title_tokens:
+                geomlog("Win32 IME popup heuristics matched small alpha window (wid=%s)", self.wid)
+                return True
         return False
 
     def set_decorated(self, decorated: bool) -> None:
