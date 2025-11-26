@@ -70,6 +70,7 @@ NotifyInferior = None
 X11Window = X11Core = None
 
 WIN32_WORKSPACE = WIN32 and envbool("XPRA_WIN32_WORKSPACE", False)
+WIN32_POPUP_TRIM_CACHE: dict[str, int] = {}
 
 
 def use_x11_bindings() -> bool:
@@ -433,9 +434,15 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             self._initial_metadata = typedict(dict(metadata))
         else:
             self._initial_metadata = typedict(metadata)
+        self._win32_shadow_disabled = False
+        self._win32_shadow_trim = 0
+        self._win32_shadow_region_applied = False
+        self._win32_shadow_detect_attempts = 0
+        self._win32_shadow_retry_source = 0
         # add platform hooks
         self.connect_after("realize", self.on_realize)
         self.connect("unrealize", self.on_unrealize)
+        self.connect("map-event", self.on_map_event)
         self.connect("enter-notify-event", self.on_enter_notify_event)
         self.connect("leave-notify-event", self.on_leave_notify_event)
         self.connect("key-press-event", self.handle_key_press_event)
@@ -519,6 +526,8 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             # Could remove it entirely from the container if needed
             # self.overlay_container.remove(self.loading_overlay)
             # self.loading_overlay = None
+        if WIN32 and self.is_OR() and self._is_wine_popup_menu():
+            self._queue_win32_shadow_retry(0)
 
     def _reset_overlay_tracking(self) -> None:
         """
@@ -1724,6 +1733,8 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                 self.do_set_x11_property("_NET_WM_PID", "u32", self.watcher_pid)
         if self.group_leader:
             self.get_window().set_group(self.group_leader)
+        if WIN32:
+            self._maybe_disable_win32_shadow()
         
         # PATCH: Force position for Wine popup menus after realize
         # GTK may reposition the window during realize
@@ -1747,8 +1758,18 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
 
     def on_unrealize(self, widget) -> None:
         eventslog("on_unrealize(%s)", widget)
+        if WIN32 and self.is_OR():
+            self._mark_win32_shadow_dirty(True)
         self.cancel_follow_handler()
         remove_window_hooks(self)
+
+    def on_map_event(self, widget, _event) -> bool:
+        if WIN32 and self.is_OR() and self._is_wine_popup_menu():
+            if self._win32_shadow_trim:
+                geomlog("Win32 popup remapped, forcing shadow re-detect (wid=%s)", self.wid)
+            self._mark_win32_shadow_dirty(True)
+            self._queue_win32_shadow_retry(0)
+        return False
 
     def set_alpha(self) -> None:
         # try to enable alpha on this window if needed,
@@ -1946,30 +1967,388 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
 
     def set_shape(self, shape) -> None:
         shapelog("set_shape(%s)", shape)
-        if not HAS_X11_BINDINGS or not XSHAPE:
+        if not shape:
             return
 
         def do_set_shape() -> None:
-            xid = self.get_window().get_xid()
-            x_off, y_off = shape.get("x", 0), shape.get("y", 0)
-            for kind, name in SHAPE_KIND.items():
-                rectangles = shape.get("%s.rectangles" % name)  # ie: Bounding.rectangles = [(0, 0, 150, 100)]
-                if rectangles:
-                    # adjust for scaling:
-                    if self._xscale != 1 or self._yscale != 1:
-                        x_off = self.sx(x_off)
-                        y_off = self.sy(y_off)
-                        rectangles = self.scale_shape_rectangles(name, rectangles)
-                    if name == "Bounding" and self.border.shown and self.border.size > 0:
-                        ww, wh = self._size
-                        rectangles = add_border_rectangles(rectangles, ww, wh, self.border.size)
+            window = self.get_window()
+            if not window:
+                return
+            use_x11_shape = HAS_X11_BINDINGS and XSHAPE
+            xid = window.get_xid() if use_x11_shape else None
+            base_x, base_y = shape.get("x", 0), shape.get("y", 0)
+            if use_x11_shape:
+                shape_defs = tuple(SHAPE_KIND.items())
+            else:
+                shape_defs = tuple((None, name) for name in ("Bounding", "Clip", "Input"))
+            for kind, name in shape_defs:
+                rectangles = shape.get(f"{name}.rectangles")  # ie: Bounding.rectangles = [(0, 0, 150, 100)]
+                if not rectangles:
+                    continue
+                x_off = base_x
+                y_off = base_y
+                # adjust for scaling:
+                if self._xscale != 1 or self._yscale != 1:
+                    x_off = self.sx(base_x)
+                    y_off = self.sy(base_y)
+                    rectangles = self.scale_shape_rectangles(name, rectangles)
+                if name == "Bounding" and self.border.shown and self.border.size > 0:
+                    ww, wh = self._size
+                    rectangles = add_border_rectangles(rectangles, ww, wh, self.border.size)
+                if use_x11_shape:
                     # too expensive to log with actual rectangles:
                     shapelog("XShapeCombineRectangles(%#x, %s, %i, %i, %i rects)",
                              xid, name, x_off, y_off, len(rectangles))
                     with xlog:
                         X11Window.XShapeCombineRectangles(xid, kind, x_off, y_off, rectangles)
+                else:
+                    self._apply_gdk_shape_region(window, name, rectangles, x_off, y_off)
 
         self.when_realized("shape", do_set_shape)
+
+    def _apply_gdk_shape_region(self, window, name: str, rectangles, x_off: int, y_off: int) -> None:
+        """Apply window shapes using GDK for platforms without XShape."""
+        if WIN32 and name == "Bounding":
+            applied = self._apply_win32_shape_region(window, rectangles, x_off, y_off)
+            if applied:
+                return
+        region = None
+        if rectangles:
+            try:
+                region = Region()
+                for rx, ry, rw, rh in rectangles:
+                    region.union(RectangleInt(rx, ry, rw, rh))
+            except Exception as exc:  # pragma: no cover - defensive
+                shapelog("failed to build region for %s: %s", name, exc)
+                region = None
+        combine = window.input_shape_combine_region if name.lower() == "input" else window.shape_combine_region
+        combine(region, x_off, y_off)
+
+    def _apply_win32_shape_region(self, gdk_window, rectangles, x_off: int, y_off: int) -> bool:
+        """Use native Win32 region APIs to clip a shaped Wine popup."""
+        try:
+            from xpra.platform.win32.gui import get_window_handle  # pylint: disable=import-outside-toplevel
+            from xpra.platform.win32.common import (  # pylint: disable=import-outside-toplevel
+                CreateRectRgn, CombineRgn, SetWindowRgn, DeleteObject,
+            )
+            from xpra.platform.win32 import constants as win32con  # pylint: disable=import-outside-toplevel
+        except Exception as exc:  # pragma: no cover - defensive
+            shapelog("Win32 shape helpers unavailable: %s", exc)
+            return False
+        try:
+            hwnd = get_window_handle(gdk_window)
+        except Exception as exc:  # pragma: no cover - defensive
+            shapelog("Win32 get_window_handle failed: %s", exc)
+            return False
+        if not hwnd:
+            shapelog("Win32 get_window_handle returned 0")
+            return False
+        region_handle = None
+        try:
+            for rx, ry, rw, rh in rectangles:
+                left = int(round(x_off + rx))
+                top = int(round(y_off + ry))
+                right = int(round(left + rw))
+                bottom = int(round(top + rh))
+                rect_region = CreateRectRgn(left, top, right, bottom)
+                if not rect_region:
+                    continue
+                if not region_handle:
+                    region_handle = rect_region
+                else:
+                    CombineRgn(region_handle, region_handle, rect_region, win32con.RGN_OR)
+                    DeleteObject(rect_region)
+        except Exception as exc:  # pragma: no cover - defensive
+            shapelog("Win32 region construction failed: %s", exc)
+            if region_handle:
+                DeleteObject(region_handle)
+            return False
+        # if no rectangles, clear any existing region
+        target_region = region_handle or None
+        result = SetWindowRgn(hwnd, target_region, True)
+        if not result and region_handle:
+            DeleteObject(region_handle)
+        shapelog("Win32 SetWindowRgn(hwnd=%#x, rects=%s) result=%s", hwnd, len(rectangles), bool(result))
+        return bool(result)
+
+    def _mark_win32_shadow_dirty(self, reset_trim: bool = False) -> None:
+        """Flag the Win32 popup region so it gets recomputed / re-applied."""
+        if reset_trim:
+            self._win32_shadow_trim = 0
+            self._win32_shadow_detect_attempts = 0
+        self._win32_shadow_region_applied = False
+        if self._win32_shadow_retry_source:
+            GLib.source_remove(self._win32_shadow_retry_source)
+            self._win32_shadow_retry_source = 0
+
+    def _queue_win32_shadow_retry(self, delay_ms: int = 40) -> None:
+        """Ensure we retry trimming soon after map/resume until success."""
+        if not WIN32 or not self.is_OR():
+            return
+        metadata = getattr(self, "_initial_metadata", None) or self._metadata
+        if not metadata.boolget("_client-popup-heuristics", False):
+            return
+        if self._win32_shadow_trim and self._win32_shadow_region_applied:
+            return
+        if self._win32_shadow_retry_source:
+            return
+        self._win32_shadow_retry_source = GLib.timeout_add(max(1, delay_ms), self._win32_shadow_retry_cb)
+
+    def _win32_shadow_retry_cb(self) -> bool:
+        self._win32_shadow_retry_source = 0
+        if not WIN32 or not self.get_realized():
+            return False
+        self._maybe_trim_win32_shadow()
+        return False
+
+    def _maybe_disable_win32_shadow(self) -> None:
+        """Disable DWM shadows on heuristically detected popup windows."""
+        if self._win32_shadow_disabled:
+            return
+        metadata = getattr(self, "_initial_metadata", None) or self._metadata
+        if not metadata.boolget("_client-popup-heuristics", False):
+            return
+        if not (self._override_redirect or metadata.boolget("override-redirect", False)):
+            return
+        try:
+            from ctypes import byref, sizeof, c_int  # pylint: disable=import-outside-toplevel
+            from xpra.platform.win32.gui import get_window_handle  # pylint: disable=import-outside-toplevel
+            from xpra.platform.win32.common import (  # pylint: disable=import-outside-toplevel
+                DwmSetWindowAttribute, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            geomlog("Win32 shadow disable unavailable: %s", exc)
+            return
+        if not DwmSetWindowAttribute:
+            return
+        try:
+            hwnd = get_window_handle(self)
+        except Exception as exc:  # pragma: no cover
+            geomlog("Win32 get_window_handle failed: %s", exc)
+            return
+        if not hwnd:
+            return
+        value = c_int(DWMNCRP_DISABLED)
+        result = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, byref(value), sizeof(value))
+        if result != 0:
+            geomlog("Failed to disable DWM shadow for hwnd=%#x wid=%s (result=%s)", hwnd, self.wid, result)
+            return
+        class_shadow_removed = self._clear_win32_class_shadow(hwnd)
+        geomlog("Win32 DWM shadow disabled for hwnd=%#x wid=%s%s",
+                hwnd, self.wid, ", class shadow cleared" if class_shadow_removed else "")
+        self._win32_shadow_disabled = True
+
+    @staticmethod
+    def _clear_win32_class_shadow(hwnd: int) -> bool:
+        try:
+            from xpra.platform.win32.common import (  # pylint: disable=import-outside-toplevel
+                GetClassLongW, SetClassLongW, GCL_STYLE, CS_DROPSHADOW,
+            )
+        except Exception as exc:  # pragma: no cover
+            geomlog("Win32 class shadow helpers unavailable: %s", exc)
+            return False
+        try:
+            style = GetClassLongW(hwnd, GCL_STYLE)
+            if style & CS_DROPSHADOW:
+                SetClassLongW(hwnd, GCL_STYLE, style & ~CS_DROPSHADOW)
+                return True
+        except Exception as exc:  # pragma: no cover
+            geomlog("Failed to clear Win32 class shadow for hwnd=%#x: %s", hwnd, exc)
+        return False
+
+    def _get_win32_trim_cache_key(self) -> Optional[str]:
+        metadata = getattr(self, "_initial_metadata", None) or self._metadata
+        if not metadata:
+            return None
+        wm_class = metadata.strtupleget("class-instance", (None, None), 2, 2)
+        class_a = (wm_class[0] or "").strip().lower()
+        class_b = (wm_class[1] or "").strip().lower()
+        owner = metadata.strget("client-machine", "").strip().lower()
+        key_parts = tuple(part for part in (class_a, class_b, owner) if part)
+        if not key_parts:
+            return None
+        return "|".join(key_parts)
+
+    def _get_cached_win32_trim(self) -> int:
+        key = self._get_win32_trim_cache_key()
+        if key:
+            return WIN32_POPUP_TRIM_CACHE.get(key, 0)
+        return 0
+
+    def _store_win32_trim(self, trim: int) -> None:
+        key = self._get_win32_trim_cache_key()
+        if not key:
+            return
+        prev = WIN32_POPUP_TRIM_CACHE.get(key, 0)
+        if trim > prev:
+            WIN32_POPUP_TRIM_CACHE[key] = trim
+
+    def _maybe_trim_win32_shadow(self) -> bool:
+        """Detect solid shadow rows in the backing and clip them via SetWindowRgn."""
+        metadata = getattr(self, "_initial_metadata", None) or self._metadata
+        if not self._override_redirect or not metadata.boolget("_client-popup-heuristics", False):
+            return False
+        window = self.get_window()
+        if not window:
+            self._queue_win32_shadow_retry(40)
+            return False
+        cached_trim = self._get_cached_win32_trim()
+        if self._win32_shadow_trim:
+            if self._win32_shadow_region_applied:
+                return False
+            w, h = self._size
+            trimmed_height = max(1, h - self._win32_shadow_trim)
+            rectangles = [(0, 0, w, trimmed_height)]
+            applied = self._apply_win32_shape_region(window, rectangles, 0, 0)
+            self._win32_shadow_region_applied = applied
+            if not applied:
+                geomlog("Win32 popup shadow reapply failed for wid=%s", self.wid)
+                self._queue_win32_shadow_retry(80)
+            return False
+        self._win32_shadow_detect_attempts += 1
+        allow_fallback = self._win32_shadow_detect_attempts >= 4
+        trim, fallback_used, boundary_ratio, residual_rows = self._detect_black_shadow_rows(allow_fallback)
+        if trim <= 0:
+            if cached_trim > 0:
+                w, h = self._size
+                self._win32_shadow_trim = min(cached_trim, max(1, h - 1))
+                self._win32_shadow_region_applied = False
+                geomlog("Win32 popup shadow using cached trim %spx (wid=%s)", self._win32_shadow_trim, self.wid)
+                rectangles = [(0, 0, w, max(1, h - self._win32_shadow_trim))]
+                applied = self._apply_win32_shape_region(window, rectangles, 0, 0)
+                self._win32_shadow_region_applied = applied
+                if applied:
+                    self._store_win32_trim(self._win32_shadow_trim)
+                else:
+                    self._win32_shadow_trim = 0
+                    self._queue_win32_shadow_retry(80)
+                return False
+            self._queue_win32_shadow_retry(60)
+            return False
+        self._win32_shadow_detect_attempts = 0
+        w, h = self._size
+        height = max(1, h)
+        max_reasonable = min(80, max(24, height // 10))
+        if trim > max_reasonable:
+            geomlog("Win32 popup shadow detection trimmed %spx, clamping to %spx (wid=%s)",
+                    trim, max_reasonable, self.wid)
+            trim = max_reasonable
+        if residual_rows > 0:
+            extra = min(residual_rows, 4)
+            geomlog("Win32 popup residual dark rows=%s, extending trim by %s (wid=%s)",
+                    residual_rows, extra, self.wid)
+            trim = min(height, trim + extra)
+        boundary_ratio = max(0.0, min(1.0, boundary_ratio))
+        if not fallback_used:
+            extra_rows = 0
+            if boundary_ratio >= 0.85:
+                extra_rows = 2
+            elif boundary_ratio >= 0.65:
+                extra_rows = 1
+            if extra_rows > 0:
+                trim = min(height, trim + extra_rows)
+                geomlog("Win32 popup shadow boundary still dark (ratio=%.3f), extending trim by %spx (wid=%s)",
+                        boundary_ratio, extra_rows, self.wid)
+        if fallback_used:
+            margin = max(2, min(6, trim // 6))
+        else:
+            if boundary_ratio >= 0.8:
+                margin = 0
+            elif boundary_ratio >= 0.5:
+                margin = 1
+            else:
+                margin = 2
+        detected_trim = max(1, trim - margin)
+        if cached_trim > 0 and detected_trim + 1 < cached_trim:
+            detected_trim = min(cached_trim, height - 1)
+            geomlog("Win32 popup shadow detection %spx < cached %spx, using cached value (wid=%s)",
+                    max(1, trim - margin), cached_trim, self.wid)
+        self._win32_shadow_trim = detected_trim
+        w, h = self._size
+        trimmed_height = max(1, h - self._win32_shadow_trim)
+        rectangles = [(0, 0, w, trimmed_height)]
+        applied = self._apply_win32_shape_region(window, rectangles, 0, 0)
+        self._win32_shadow_region_applied = applied
+        if applied:
+            geomlog("Win32 popup shadow trimmed by %spx (wid=%s)", self._win32_shadow_trim, self.wid)
+            self._store_win32_trim(self._win32_shadow_trim)
+        else:
+            geomlog("Failed to apply Win32 popup trim (wid=%s)", self.wid)
+            self._win32_shadow_trim = 0
+            self._queue_win32_shadow_retry(80)
+        return False
+
+    def _detect_black_shadow_rows(self, allow_fallback: bool = False) -> tuple[int, bool, float, int]:
+        backing = getattr(self._backing, "_backing", None)
+        if not backing:
+            return 0, False, 0.0, 0
+        try:
+            backing.flush()
+            data = memoryview(backing.get_data())
+        except Exception as exc:
+            shapelog("Win32 shadow detection failed: %s", exc)
+            return 0, False, 0.0, 0
+        height = backing.get_height()
+        width = backing.get_width()
+        stride = backing.get_stride()
+        max_trim = min(96, height // 2)
+        min_trim = 8
+        threshold = 8
+        ratio_limit = 0.985
+        trim = 0
+        boundary_ratio = 0.0
+        for row in range(height - 1, max(height - max_trim, -1), -1):
+            offset = row * stride
+            row_bytes = data[offset: offset + width * 4]
+            dark_ratio = self._dark_pixel_ratio(row_bytes, width, threshold)
+            if dark_ratio < ratio_limit:
+                boundary_ratio = dark_ratio
+                break
+            trim += 1
+        if trim >= min_trim:
+            residual = self._residual_dark_rows(data, width, stride, height, trim, threshold + 8, 0.9)
+            return trim, False, boundary_ratio, residual
+        if allow_fallback:
+            fallback = min(64, max(12, height // 12))
+            residual = self._residual_dark_rows(data, width, stride, height, fallback, threshold + 8, 0.9)
+            return fallback, True, 0.0, residual
+        return 0, False, 0.0, 0
+
+    @staticmethod
+    def _residual_dark_rows(data, width: int, stride: int, height: int,
+                             trim: int, threshold: int, ratio_limit: float,
+                             max_rows: int = 4) -> int:
+        if trim <= 0 or height <= trim:
+            return 0
+        leftover = 0
+        start_row = height - trim - 1
+        for i in range(max_rows):
+            row = start_row - i
+            if row < 0:
+                break
+            offset = row * stride
+            row_bytes = data[offset: offset + width * 4]
+            dark_ratio = GTKClientWindowBase._dark_pixel_ratio(row_bytes, width, threshold)
+            if dark_ratio >= ratio_limit:
+                leftover += 1
+            else:
+                break
+        return leftover
+
+    @staticmethod
+    def _dark_pixel_ratio(row_bytes, width: int, threshold: int) -> float:
+        if width <= 0:
+            return 0.0
+        pixels = width
+        dark = 0
+        length = min(len(row_bytes), width * 4)
+        for i in range(0, length, 4):
+            b = row_bytes[i]
+            g = row_bytes[i + 1]
+            r = row_bytes[i + 2]
+            if b <= threshold and g <= threshold and r <= threshold:
+                dark += 1
+        return dark / float(pixels)
 
     def lazy_scale_shape(self, rectangles) -> list:
         # scale the rectangles without a bitmap...
@@ -3165,6 +3544,11 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         ww, wh = self.get_size()
         geomlog("resize(%s, %s, %s) current size=%s, fullscreen=%s, maximized=%s",
                 w, h, resize_counter, (ww, wh), self._fullscreen, self._maximized)
+        size_changed = (w, h) != self._size
+        if WIN32 and self.is_OR() and size_changed:
+            self._mark_win32_shadow_dirty(True)
+            if self._is_wine_popup_menu():
+                self._queue_win32_shadow_retry(0)
         self._resize_counter = resize_counter
         if (w, h) == (ww, wh):
             self._backing.offsets = 0, 0, 0, 0
@@ -3224,6 +3608,16 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         geomlog("clip_to_backing%s rectangle=%s", (backing, context), clip_rect)
         context.clip()
 
+    def after_draw_refresh(self, success, message="") -> None:
+        ClientWindowBase.after_draw_refresh(self, success, message)
+        if not success or not WIN32:
+            return
+        if not self.is_OR() or not self._is_wine_popup_menu():
+            return
+        if self._win32_shadow_trim and self._win32_shadow_region_applied:
+            return
+        self._queue_win32_shadow_retry(0)
+
     def move_resize(self, x: int, y: int, w: int, h: int, resize_counter: int = 0) -> None:
         geomlog("window %i move_resize%s", self.wid, (x, y, w, h, resize_counter))
         self._overlay_reset_measurements()
@@ -3244,7 +3638,11 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             else:
                 geomlog("WINE POPUP move_resize: size unchanged, no action (wid=%s)", self.wid)
             return
-        
+        size_changed = (w, h) != self._size
+        if WIN32 and self.is_OR() and size_changed:
+            self._mark_win32_shadow_dirty(True)
+            if self._is_wine_popup_menu():
+                self._queue_win32_shadow_retry(0)
         x, y = self.adjusted_position(x, y)
         w = max(1, w)
         h = max(1, h)
