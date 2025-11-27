@@ -70,8 +70,8 @@ NotifyInferior = None
 X11Window = X11Core = None
 
 WIN32_WORKSPACE = WIN32 and envbool("XPRA_WIN32_WORKSPACE", False)
-WIN32_POPUP_EXTRA_TRIM_DEFAULT = 5.3
-WIN32_POPUP_ROUNDING_BIAS_DEFAULT = 1.255
+WIN32_POPUP_EXTRA_TRIM_DEFAULT = 1.5
+WIN32_POPUP_ROUNDING_BIAS_DEFAULT = 0.5
 WIN32_POPUP_TRIM_CACHE: dict[str, tuple[int, float, float]] = {}
 WIN32_IME_CLASS_HINTS: tuple[str, ...] = (
     "msctfime", "ime ui", "imeui", "msime", "textinputhostwindow",
@@ -404,6 +404,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self._first_frame_received = False
         self._frame_count = 0
         self._overlay_timeout = 0
+        self._skip_overlay = False
         # PATCH: Track painted regions for smart overlay removal
         # Use a list of rectangles to track which areas have been painted
         self._painted_regions = []  # List of (x, y, w, h) tuples
@@ -414,6 +415,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self._saw_flush_value = False
         self._overlay_last_status = ""
         self._overlay_created_time = monotonic()
+        self._update_skip_overlay_state(metadata)
         self.init_drawing_area()
         self.set_decorated(self._is_decorated(metadata))
         self._window_state = {}
@@ -484,11 +486,12 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         rgba = Gdk.RGBA()
         rgba.parse("#EEF9F3")
         self.loading_overlay.override_background_color(Gtk.StateFlags.NORMAL, rgba)
-        self.loading_overlay.show()
-        self.overlay_container.add_overlay(self.loading_overlay)
+        if not self._skip_overlay:
+            self.loading_overlay.show()
+            self.overlay_container.add_overlay(self.loading_overlay)
 
         # Track overlay state
-        self._overlay_visible = True
+        self._overlay_visible = not self._skip_overlay
         self._first_frame_received = False
         self._frame_count = 0  # Number of frames received
         self._overlay_created_time = monotonic()
@@ -537,7 +540,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             # Could remove it entirely from the container if needed
             # self.overlay_container.remove(self.loading_overlay)
             # self.loading_overlay = None
-        if WIN32 and self.is_OR() and self._is_wine_popup_menu():
+        if WIN32 and self.is_OR() and (self._is_wine_popup_menu() or self._is_win32_ime_popup()):
             self._queue_win32_shadow_retry(0)
 
     def _reset_overlay_tracking(self) -> None:
@@ -619,7 +622,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         Uses smart coverage tracking instead of black pixel detection.
         """
         # Track painted regions for overlay removal (ignore "void" frames)
-        if self._overlay_visible and coding != "void":
+        if not self._skip_overlay and self._overlay_visible and coding != "void":
             flush_value = -1
             if hasattr(options, "intget"):
                 flush_value = options.intget("flush", -1)
@@ -1330,10 +1333,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                self.wid, self.is_OR(), has_transient, criteria_count)
         return False
 
-    def _is_win32_ime_popup(self) -> bool:
-        if not WIN32 or not self.is_OR():
-            return False
-        metadata = getattr(self, "_initial_metadata", None) or self._metadata
+    def _metadata_is_win32_ime(self, metadata: typedict | None) -> bool:
         if not metadata:
             return False
         wm_class = metadata.strtupleget("class-instance", (None, None), 2, 2)
@@ -1359,7 +1359,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                 if hint in command:
                     geomlog("Win32 IME popup detected via command %r (hint=%s, wid=%s)", command, hint, self.wid)
                     return True
-        width, height = self._size
+        width, height = metadata.intpair("geometry-size", self._size) if isinstance(metadata, typedict) else self._size
         if width <= 400 and height <= 160 and (("POPUP_MENU" in metadata.strtupleget("window-type", ())) or
                                                metadata.boolget("has-alpha", False)):
             title_tokens = (title or "") + " " + " ".join(class_tokens)
@@ -1367,6 +1367,33 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                 geomlog("Win32 IME popup heuristics matched small alpha window (wid=%s)", self.wid)
                 return True
         return False
+
+    def _is_win32_ime_popup(self) -> bool:
+        if not WIN32 or not self.is_OR():
+            return False
+        metadata = getattr(self, "_initial_metadata", None) or self._metadata
+        if self._metadata_is_win32_ime(metadata):
+            self._ensure_skip_overlay()
+            return True
+        return False
+
+    def _update_skip_overlay_state(self, metadata: typedict | None = None) -> None:
+        if not WIN32 or not self.is_OR():
+            return
+        metadata = metadata or getattr(self, "_initial_metadata", None) or self._metadata
+        skip = self._metadata_is_win32_ime(metadata)
+        if skip:
+            self._ensure_skip_overlay()
+        elif not skip and self._skip_overlay:
+            self._skip_overlay = False
+
+    def _ensure_skip_overlay(self) -> None:
+        if self._skip_overlay:
+            return
+        self._skip_overlay = True
+        self._overlay_visible = False
+        if self.loading_overlay:
+            self.loading_overlay.hide()
 
     def set_decorated(self, decorated: bool) -> None:
         was_decorated = self.get_decorated()
@@ -1498,6 +1525,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
     def set_metadata(self, metadata: typedict):
         # Call parent method first to update metadata
         super().set_metadata(metadata)
+        self._update_skip_overlay_state(metadata)
         
         # PATCH: Re-check position for Wine popup menus after metadata is updated.
         # Issue: set_initial_position() runs before metadata has transient-for,
@@ -3699,7 +3727,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         ClientWindowBase.after_draw_refresh(self, success, message)
         if not success or not WIN32:
             return
-        if not self.is_OR() or not self._is_wine_popup_menu():
+        if not self.is_OR() or not (self._is_wine_popup_menu() or self._is_win32_ime_popup()):
             return
         if self._win32_shadow_trim and self._win32_shadow_region_applied:
             return
