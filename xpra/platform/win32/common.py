@@ -33,6 +33,7 @@ PBYTE = POINTER(BYTE)
 HCURSOR = HANDLE
 HICON = HANDLE
 HBRUSH = HANDLE
+HRGN = HANDLE
 
 
 class CURSORINFO(Structure):
@@ -339,6 +340,12 @@ SetWindowLongA.argtypes = [HWND, INT, LONG]
 SetWindowLongW = user32.SetWindowLongW
 SetWindowLongW.restype = LONG
 SetWindowLongW.argtypes = [HWND, INT, WNDPROC]
+GetClassLongW = user32.GetClassLongW
+GetClassLongW.restype = ULONG
+GetClassLongW.argtypes = [HWND, INT]
+SetClassLongW = user32.SetClassLongW
+SetClassLongW.restype = ULONG
+SetClassLongW.argtypes = [HWND, INT, LONG]
 GetWindowLongW = user32.GetWindowLongW
 GetWindowLongW.restype = LONG
 GetWindowLongW.argtypes = [HWND, INT]
@@ -700,6 +707,39 @@ CreateDIBitmap.argtypes = [HDC, PBITMAPINFOHEADER, DWORD, c_void_p, PBITMAPINFO,
 DeleteObject = gdi32.DeleteObject
 DeleteObject.argtypes = [HGDIOBJ]
 DeleteObject.restype = BOOL
+
+CreateRectRgn = gdi32.CreateRectRgn
+CreateRectRgn.argtypes = [INT, INT, INT, INT]
+CreateRectRgn.restype = HRGN
+
+CombineRgn = gdi32.CombineRgn
+CombineRgn.argtypes = [HRGN, HRGN, HRGN, INT]
+CombineRgn.restype = INT
+
+SetWindowRgn = user32.SetWindowRgn
+SetWindowRgn.argtypes = [HWND, HRGN, BOOL]
+SetWindowRgn.restype = INT
+
+try:
+    dwmapi = WinDLL("dwmapi")
+except Exception:
+    dwmapi = None
+
+if dwmapi:
+    DwmSetWindowAttribute = dwmapi.DwmSetWindowAttribute
+    DwmSetWindowAttribute.argtypes = [HWND, DWORD, c_void_p, DWORD]
+    DwmSetWindowAttribute.restype = c_int
+else:
+    DwmSetWindowAttribute = None
+
+DWMWA_NCRENDERING_ENABLED = 1
+DWMWA_NCRENDERING_POLICY = 2
+DWMNCRP_USEWINDOWSTYLE = 0
+DWMNCRP_DISABLED = 1
+DWMNCRP_ENABLED = 2
+
+GCL_STYLE = -26
+CS_DROPSHADOW = 0x20000
 DeleteDC = gdi32.DeleteDC
 DeleteDC.restype = BOOL
 DeleteDC.argtypes = [HDC]
